@@ -241,31 +241,43 @@ if exists gcloud firestore databases describe --database="$FS_DATABASE" --projec
 else
   run gcloud firestore databases create --database="$FS_DATABASE" --location="$R" --type=firestore-native --project="$P"
 fi
-existing_indexes="$(gcloud firestore indexes composite list --project="$P" --database="$FS_DATABASE" \
-  --format='value(name)' 2>/dev/null || true)"
 create_index() {
   local group="$1"; shift
-  if grep -q "collectionGroups/$group/" <<< "$existing_indexes"; then
-    echo "index on $group: exists"
-  else
-    if [[ "$DRY_RUN" == "1" ]]; then
-      run gcloud firestore indexes composite create --project="$P" --database="$FS_DATABASE" \
-        --collection-group="$group" "$@" --async --quiet
-    elif ! err="$(gcloud firestore indexes composite create --project="$P" --database="$FS_DATABASE" \
-        --collection-group="$group" "$@" --async --quiet 2>&1 >/dev/null)"; then
-      # Another run (another factory on the same sandbox) can create it between the list and the create.
-      grep -q 'ALREADY_EXISTS' <<< "$err" || { echo "$err" >&2; return 1; }
-      echo "index on $group: exists"
-      return 0
-    fi
-    echo "index on $group: creating (async)"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    run gcloud firestore indexes composite create --project="$P" --database="$FS_DATABASE" \
+      --collection-group="$group" "$@" --async --quiet
+    return 0
   fi
+  local err
+  if ! err="$(gcloud firestore indexes composite create --project="$P" --database="$FS_DATABASE" \
+      --collection-group="$group" "$@" --async --quiet 2>&1 >/dev/null)"; then
+    grep -q 'ALREADY_EXISTS' <<< "$err" || { echo "$err" >&2; return 1; }
+    echo "index on $group: exists"
+    return 0
+  fi
+  echo "index on $group: creating (async)"
 }
 # Keep in sync with config/firestore/firestore.indexes.json (tests check that file).
 create_index factory_agent_status --field-config=field-path=project_slug,order=ascending \
   --field-config=field-path=agent_name,order=ascending
 create_index eval_runs --field-config=field-path=project_slug,order=ascending \
   --field-config=field-path=evaluated_at,order=descending
+create_index eval_analyses --field-config=field-path=project_slug,order=ascending \
+  --field-config=field-path=updated_at,order=descending
+create_index eval_analyses --field-config=field-path=status,order=ascending \
+  --field-config=field-path=updated_at,order=descending
+create_index eval_analyses --field-config=field-path=project_slug,order=ascending \
+  --field-config=field-path=status,order=ascending \
+  --field-config=field-path=updated_at,order=descending
+create_index eval_clone_groups --field-config=field-path=project_slug,order=ascending \
+  --field-config=field-path=created_at,order=descending
+create_index eval_clone_groups --field-config=field-path=source_task_id,order=ascending \
+  --field-config=field-path=created_at,order=descending
+create_index eval_factory_overrides --field-config=field-path=status,order=ascending \
+  --field-config=field-path=applied_at,order=descending
+create_index eval_factory_overrides --field-config=field-path=project_slug,order=ascending \
+  --field-config=field-path=status,order=ascending \
+  --field-config=field-path=applied_at,order=descending
 bind_project "serviceAccount:$DASHBOARD_RUNTIME_SA" roles/datastore.viewer
 echo "datastore.viewer: $DASHBOARD_RUNTIME_SA (dashboard); datastore.user: VM SA (sync, eval agents)"
 if exists gcloud storage buckets describe "gs://$DATA_BUCKET" --project="$P"; then

@@ -24,7 +24,7 @@ Run all commands from the root of the `scion-defaults` repository.
 - Don't compile until `check` reports `ready=True`.
 - Steer toward serverless. The factory control plane is always Firestore; never propose Spanner or another
   provisioned database for it. For the product, default to Cloud Run, Firestore, BigQuery, Cloud Storage, and Vertex
-  AI, and record a provisioned store (Spanner, AlloyDB, Cloud SQL) only with the requirement that justifies it.
+  AI, and record a provisioned store (Spanner, AlloyDB, Cloud SQL) only with the requirement that justifies it. For GCP Serverless Kit execution rules (no polling in Cloud Run services, Cloud Run Jobs/Worker Pools, AlloyDB Express, Pub/Sub, Workflows, Cloud Tasks, Cloud Scheduler, Golang, `task-context.json` claim tracking, and `scion-eval clone-task`), reference [`skills/gcp-serverless-kit/SKILL.md`](../gcp-serverless-kit/SKILL.md).
 
 ## Step 0: Target Hub mode
 

@@ -72,3 +72,9 @@ All agents of a project share one checkout at `/workspace` (branch `${BUILD_BRAN
 - Cloud Run services run as a dedicated runtime service account with only the roles they need, never as the default
   compute service account.
 - IAM grants, new paid resources and scope changes are PO decisions: ask, don't act.
+
+## Task context, clones & GCP Serverless Kit
+
+- **Task context on claim:** When claiming a task with `scion-tracker claim <task_id>` (or `ft task claim`), verify `/home/scion/.scion/task-context.json` records `task_id`, `parent_task_id`, `clone_group_id`, `clone_id`, `template_name`, `template_hash`, and `agent_role` so `scion-eval transcript-ship` and BigQuery session attribution link runtime logs/traces accurately.
+- **Clone branch isolation:** When executing a task clone on branch `task/<task_id>/clone-<k>`, push only to that clone branch; never push directly to `${BUILD_BRANCH}` or `main`.
+- **GCP Serverless Kit rules:** Never run background polling loops inside Cloud Run services—use Cloud Run Jobs, Cloud Run Worker Pools, Pub/Sub push, Cloud Workflows, Cloud Tasks, or Cloud Scheduler. Respect Spanner/Firestore/AlloyDB Express connection and transaction boundaries, GCS immutable artifacts, BigQuery partition filters (`require_partition_filter`) with `maximum_bytes_billed` caps, and Go `context.Context` deadlines, graceful `SIGTERM`, parameterized SQL, and `go test -race ./...`. See `skills/gcp-serverless-kit/SKILL.md`.

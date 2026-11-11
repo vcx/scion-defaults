@@ -27,6 +27,112 @@
           "order": "DESCENDING"
         }
       ]
+    },
+    {
+      "collectionGroup": "eval_analyses",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "project_slug",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "updated_at",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "eval_analyses",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "status",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "updated_at",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "eval_analyses",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "project_slug",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "status",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "updated_at",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "eval_clone_groups",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "project_slug",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "created_at",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "eval_clone_groups",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "source_task_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "created_at",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "eval_factory_overrides",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "status",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "applied_at",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "eval_factory_overrides",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "project_slug",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "status",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "applied_at",
+          "order": "DESCENDING"
+        }
+      ]
     }
   ],
   "fieldOverrides": []

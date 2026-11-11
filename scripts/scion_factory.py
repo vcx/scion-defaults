@@ -1122,6 +1122,26 @@ The evaluation team grades the code of the build's commits, not a live service:
 {render_code_pyramid(spec)}
 """
 
+    cloud_stores = infra.get("cloud_stores") or []
+    stores_note = "Spanner, Firestore, AlloyDB Express" if "spanner" in cloud_stores else "Firestore, AlloyDB Express"
+    if serves:
+        kit_rules = (
+            f"- **GCP Serverless Kit rules:** Keep Cloud Run services stateless with **no background polling loops** "
+            f"(use Cloud Run Jobs, Worker Pools, Pub/Sub push, Cloud Workflows, Cloud Tasks, or Cloud Scheduler); "
+            f"follow {stores_note}, GCS immutable object, BigQuery partition-filter (`require_partition_filter` + "
+            f"`maximum_bytes_billed`), and Golang (`context.Context`, `SIGTERM`, parameterized SQL, `go test -race ./...`) guidelines."
+        )
+    else:
+        kit_rules = (
+            f"- **Engineering & store hygiene:** Follow {stores_note}, GCS immutable object, BigQuery partition-filter "
+            f"(`require_partition_filter` + `maximum_bytes_billed`), and Golang (`context.Context`, parameterized SQL, "
+            f"`go test -race ./...`) guidelines where applicable."
+        )
+    serverless_kit = f"""## 8. Task Context, Clones & Engineering Guardrails
+- **Task context on claim:** When claiming work via `scion-tracker claim <task_id>` (or `ft task claim`), verify `/home/scion/.scion/task-context.json` records `task_id`, `parent_task_id`, `clone_group_id`, `clone_id`, `template_name`, and `agent_role`.
+- **Clone isolation:** Clone tasks (`scion-eval clone-task`) push only to `task/<task_id>/clone-<k>`, never directly to the trunk branch.
+{kit_rules}"""
+
     return f"""# Shared Factory Agent Protocol — {proj['name']} (`{proj['slug']}` & `{proj['eval_slug']}`)
 
 Every agent in this Scion software factory MUST follow these operational rules (derived from Lessons L1–L27).
@@ -1147,7 +1167,9 @@ Every agent in this Scion software factory MUST follow these operational rules (
 - **Signal turn completion (L2):** End every turn by running `sciontool status task_completed "<concise summary with {turn_ref}>"` (or `sciontool status ask_user "<blocker>"` when genuinely blocked).
 {escalation}
 
-{pyramid}"""
+{pyramid}
+
+{serverless_kit}"""
 
 
 def _render_scion_agent_yaml(role_spec: dict[str, Any], spec: dict[str, Any] | None = None) -> str:
@@ -1660,6 +1682,64 @@ FIRESTORE_INDEXES = {
                 {"fieldPath": "evaluated_at", "order": "DESCENDING"},
             ],
         },
+        {
+            "collectionGroup": "eval_analyses",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {"fieldPath": "project_slug", "order": "ASCENDING"},
+                {"fieldPath": "updated_at", "order": "DESCENDING"},
+            ],
+        },
+        {
+            "collectionGroup": "eval_analyses",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {"fieldPath": "status", "order": "ASCENDING"},
+                {"fieldPath": "updated_at", "order": "DESCENDING"},
+            ],
+        },
+        {
+            "collectionGroup": "eval_analyses",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {"fieldPath": "project_slug", "order": "ASCENDING"},
+                {"fieldPath": "status", "order": "ASCENDING"},
+                {"fieldPath": "updated_at", "order": "DESCENDING"},
+            ],
+        },
+        {
+            "collectionGroup": "eval_clone_groups",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {"fieldPath": "project_slug", "order": "ASCENDING"},
+                {"fieldPath": "created_at", "order": "DESCENDING"},
+            ],
+        },
+        {
+            "collectionGroup": "eval_clone_groups",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {"fieldPath": "source_task_id", "order": "ASCENDING"},
+                {"fieldPath": "created_at", "order": "DESCENDING"},
+            ],
+        },
+        {
+            "collectionGroup": "eval_factory_overrides",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {"fieldPath": "status", "order": "ASCENDING"},
+                {"fieldPath": "applied_at", "order": "DESCENDING"},
+            ],
+        },
+        {
+            "collectionGroup": "eval_factory_overrides",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {"fieldPath": "project_slug", "order": "ASCENDING"},
+                {"fieldPath": "status", "order": "ASCENDING"},
+                {"fieldPath": "applied_at", "order": "DESCENDING"},
+            ],
+        },
     ],
     "fieldOverrides": [],
 }
@@ -1731,6 +1811,13 @@ Document ID: `run_id`.
 | `requirements` | array of `{{id, status}}` | One entry per `REQ-` ID evaluated |
 | `diagnostics` | map | Free-form evidence |
 | `evaluated_at` | timestamp | Server time of the write |
+
+## `EVAL FÁBRICA` (`eval_*`)
+
+- **`eval_analyses` (`<analysis_id>`):** scientific investigation linking `task_ids`, `bq_evidence`, `hypothesis`, `experiment`, `results`, `artifacts` (`report_url`, `snapshot_url`, `diff_url`), `governance`, and `action_log`.
+- **`eval_clone_groups` (`<clone_group_id>`):** parallel task clones (`variants[]` with `snapshot_url`, `transcript_uri`, `winner_clone_id`, `diff_url`).
+- **`eval_agent_state` (`<project_slug>`):** `governance_mode` (`autonomous` | `human_approval` | `manual`), `policy`, `cursors`, `spend`, `cooldown_until`.
+- **`eval_factory_overrides` (`<override_id>`):** reversible Runtime API mutations (`previous_state`, `applied_state`, `status`: `active` | `promoted_to_git` | `rolled_back` | `expired`, `rollback_after_tasks`).
 
 ## Set up
 

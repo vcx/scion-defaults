@@ -140,7 +140,13 @@ def test_compiled_starter_kit_is_serverless_firestore(tmp_path):
     assert contract.exists() and "factory_agent_status" in contract.read_text() and "eval_runs" in contract.read_text()
     indexes = json.loads((out / "config" / "firestore" / "firestore.indexes.json").read_text())
     groups = {i["collectionGroup"] for i in indexes["indexes"]}
-    assert groups == {"factory_agent_status", "eval_runs"}
+    assert groups == {
+        "factory_agent_status",
+        "eval_runs",
+        "eval_analyses",
+        "eval_clone_groups",
+        "eval_factory_overrides",
+    }
     assert "if false" in (out / "config" / "firestore" / "firestore.rules").read_text()
 
     tool = out / "eval-workspace" / "tools" / "factory_store.py"

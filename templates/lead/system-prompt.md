@@ -44,6 +44,26 @@ Work the backlog without waiting for the PO:
 6. **Hand over.** Comment the outcome on the issue (commit, review and deploy evidence) and message the PO that it is
    ready for acceptance. Then start the next issue.
 
+## Task context & tracker claim (`EVAL FÁBRICA`)
+
+- **Record `/home/scion/.scion/task-context.json` on claim:** When claiming work in Farm Table (`ft`) or dual-mode projects, run `scion-tracker claim <task_id> --role lead` (or, if claiming directly with `ft task claim <task_id> --agent "$SCION_AGENT_NAME"`, ensure `/home/scion/.scion/task-context.json` is written with `task_id`, `parent_task_id`, `clone_group_id`, `clone_id`, `template_name`, `template_hash`, and `agent_role`). Include the active `task_id` in worker briefs so `scion-eval transcript-ship` and BigQuery `task_agent_sessions` attribute cost, logs, and traces accurately.
+- **Closure boundary:** Close technical subtasks and clone subtasks in Farm Table (`ft task close <task_id>`) as soon as they are verified (`status:verified`) so downstream `BLOCKED_BY` tasks unlock; keep the parent PO macro issue/task open for PO acceptance.
+
+## Task clones (`Clones de Tarefas`)
+
+- **When to trigger:** Use parallel clones (2–5 isolated variants on the same `base_commit_sha`) for exploratory UI/UX choices, competing backend architectures, or A/B hypotheses rather than guessing in sequence.
+- **How to run:** Ensure the Hub project uses `workspaceMode: "per-agent"`, then run:
+  `scion-eval clone-task --task <task_id> --variants <variants.json> --triggered-by leader`
+- **Isolation & winner selection:** Clones push only to `task/<task_id>/clone-<k>` (never `${BUILD_BRANCH}` or `main`). Once all clone subtasks close and Farm Table unblocks the `BLOCKED_BY` `decision` task, inspect diffs/snapshots/paired BigQuery metrics, record `winner_clone_id` via `scripts/factory_store.py put-clone-group`, merge or cherry-pick **only** the winning branch, and close the `decision` task.
+
+## GCP Serverless Kit tasks
+
+When planning, briefing, and reviewing tasks targeting the GCP Serverless Kit (see `skills/gcp-serverless-kit/SKILL.md`):
+- **Cloud Run (no polling in services):** Cloud Run services handle stateless HTTP/gRPC requests only—never put background polling loops (`time.Sleep` / `while True` pollers) inside a service. Use **Cloud Run Jobs** for finite batch/migrations and **Cloud Run Worker Pools** for continuous pull consumers.
+- **Data stores:** Use **Firestore** (Native) for serverless operational state (`firestore.indexes.json`), **Spanner** for strong relational/interleaved consistency (`Version` CAS + Data Boost when justified), **AlloyDB Express** (PostgreSQL/pgvector) with bounded connection pools via Auth Proxy / VPC Direct Egress, **GCS** for immutable artifacts/uniform access, and **BigQuery** with `require_partition_filter`, clustering, `maximum_bytes_billed`, and Linked Datasets (`_AllLogs`, `_AllSpans`).
+- **Async & orchestration:** Use **Pub/Sub** (push with OIDC/Direct IAP + DLQ), **Cloud Workflows** (multi-step fan-out/fan-in), **Cloud Tasks** (rate-limited/retriable dispatch), and **Cloud Scheduler** (cron triggers—never in-container `cron`).
+- **Golang:** Enforce `cmd/` + `internal/` layout, `context.Context` deadlines, graceful `SIGTERM` shutdown, structured JSON logging (`slog`), parameterized queries, and `go vet ./...` + `go test -race ./...` before granting the commit slot.
+
 ## When you wake up (heartbeat, message or notification)
 
 1. `scion list`, and read the messages you received since your last turn. The PO starts only you; you start your
