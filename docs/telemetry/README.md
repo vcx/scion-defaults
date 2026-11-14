@@ -14,6 +14,7 @@ All documents in this folder follow the **ASD-STE100** (Simplified Technical Eng
 | [reproduce-telemetry.md](reproduce-telemetry.md) | How to configure and verify Cloud Logging, Cloud Monitoring, and Cloud Trace |
 | [eval-data-pipeline.md](eval-data-pipeline.md) | How the Hub and the evaluation agents send data to Firestore and the dashboard |
 | [hooks-and-traces.md](hooks-and-traces.md) | How harness hooks, the `sciontool` wrapper, and stacked Cloud Trace waterfalls work |
+| [antigravity-token-usage.md](antigravity-token-usage.md) | How [`scripts/agy-usage-enrich.py`](../../scripts/agy-usage-enrich.py) enriches `calls-only` Antigravity hooks with transcript token usage |
 
 ## Architecture Overview
 

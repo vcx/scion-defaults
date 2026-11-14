@@ -26,6 +26,7 @@ To make sure every hook subprocess and PID 1 have the telemetry settings without
 3. Detects `--dialect=<harness>` from the command arguments and sets `SCION_HARNESS`, `SCION_MODEL`, and `SCION_USAGE_SOURCE`:
    - `claude`: `SCION_USAGE_SOURCE=native` (prevents double-counting tokens between OTLP logs and hooks).
    - `antigravity`, `opencode`, `hermes`: `SCION_USAGE_SOURCE=hooks` (records token usage directly from hook JSON payloads).
+   - Because upstream `agy` omits token counts on `PostInvocation` `stdin`, pipe `PostInvocation` payloads through [`scripts/agy-usage-enrich.py`](../../scripts/agy-usage-enrich.py). See [`antigravity-token-usage.md`](antigravity-token-usage.md).
 4. Executes `/usr/local/bin/sciontool.real "$@"`.
 
 ---
