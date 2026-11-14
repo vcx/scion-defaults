@@ -300,6 +300,43 @@ def test_validate_agent_state_and_override_rules():
     assert "rollback_after_tasks" in ovr_problems
 
 
+def test_validate_snapshot_rules_and_conservation_law():
+    snap = {
+        "snapshot_id": "2026-11-14T02-00-00Z_8f92b11",
+        "project_slug": "acme-shop",
+        "git_sha": "8f92b11",
+        "git_branch": "main",
+        "trigger": "commit",
+        "reconciliation_id": "recon-001",
+        "finops": {
+            "total_cost_usd": 3.45,
+            "productive_cost_usd": 2.50,
+            "rework_cost_usd": 0.65,
+            "heartbeat_tax_usd": 0.30,
+            "conservation_drift_usd": 0.0,
+        },
+        "trajectories_summary": {"tasks_count": 4},
+        "agents_summary": {"cache_bloat_slope": 420.0},
+        "system_summary": {"verdict": "PASS"},
+        "transcript_refs": [
+            {
+                "task_id": "ft-42",
+                "agent_id": "backend",
+                "incarnation_id": "inc-1",
+                "proxy_url": "/api/v2/transcripts/acme-shop/ft-42/backend/inc-1",
+            }
+        ],
+    }
+    assert factory_store.validate_snapshot(snap) == []
+
+    bad_snap = copy.deepcopy(snap)
+    bad_snap["finops"]["rework_cost_usd"] = 0.80  # drift = 0.15 != 0.0
+    bad_snap["transcript_refs"][0]["proxy_url"] = "not a valid url"
+    problems = " | ".join(factory_store.validate_snapshot(bad_snap))
+    assert "conservation law" in problems
+    assert "transcript_refs[0].proxy_url" in problems
+
+
 # ---------------------------------------------------------------------------
 # Dry-run CLI tests for all 10 new subcommands
 # ---------------------------------------------------------------------------
@@ -389,6 +426,32 @@ def test_all_new_subcommands_dry_run(tmp_path):
     assert w["update"]["name"].endswith("/eval_factory_overrides/ovr-1")
     assert set(w["updateMask"]["fieldPaths"]) == {"status", "resolution_note"}
     assert w["updateTransforms"][0]["fieldPath"] == "resolved_at"
+
+    snap_file = tmp_path / "snapshot.json"
+    snap_file.write_text(json.dumps({
+        "snapshot_id": "snap-1",
+        "project_slug": "demo",
+        "finops": {
+            "total_cost_usd": 1.0,
+            "productive_cost_usd": 0.7,
+            "rework_cost_usd": 0.2,
+            "heartbeat_tax_usd": 0.1,
+            "conservation_drift_usd": 0.0,
+        },
+    }))
+    rc, out, err = _run_cli(["--project", "demo-proj", "--dry-run", "put-snapshot", "--file", str(snap_file)])
+    assert rc == 0, err
+    assert json.loads(out)["body"]["writes"][0]["update"]["name"].endswith("/eval_snapshots/demo__snap-1")
+
+    rc, out, err = _run_cli(["--project", "demo-proj", "--dry-run", "get-snapshot", "--project-slug", "demo", "--snapshot-id", "snap-1"])
+    assert rc == 0, err
+    assert json.loads(out)["url"].endswith("/eval_snapshots/demo__snap-1")
+
+    rc, out, err = _run_cli(["--project", "demo-proj", "--dry-run", "list-snapshots", "--project-slug", "demo", "--limit", "5"])
+    assert rc == 0, err
+    sq = json.loads(out)["body"]["structuredQuery"]
+    assert sq["from"][0]["collectionId"] == "eval_snapshots"
+    assert sq["limit"] == 5
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +628,60 @@ def test_eval_fabrica_end_to_end_crud_with_emulator(fake_emulator, tmp_path):
     assert rc != 0
     assert "not found" in err
 
+    # 5. eval_snapshots: put -> get (both --project-slug/--snapshot-id and doc_id) -> list-snapshots
+    snap1 = {
+        "snapshot_id": "snap-100",
+        "project_slug": "acme-shop",
+        "git_sha": "abc1234",
+        "git_branch": "main",
+        "trigger": "commit",
+        "reconciliation_id": "recon-100",
+        "finops": {
+            "total_cost_usd": 2.0,
+            "productive_cost_usd": 1.5,
+            "rework_cost_usd": 0.3,
+            "heartbeat_tax_usd": 0.2,
+            "conservation_drift_usd": 0.0,
+        },
+        "transcript_refs": [
+            {
+                "task_id": "t-1",
+                "agent_id": "backend",
+                "incarnation_id": "inc-1",
+                "proxy_url": "/api/v2/transcripts/acme-shop/t-1/backend/inc-1",
+            }
+        ],
+    }
+    snap2 = {
+        "snapshot_id": "snap-200",
+        "project_slug": "other-shop",
+        "finops": {
+            "total_cost_usd": 0.5,
+            "productive_cost_usd": 0.5,
+            "rework_cost_usd": 0.0,
+            "heartbeat_tax_usd": 0.0,
+            "conservation_drift_usd": 0.0,
+        },
+    }
+    assert _run_cli(["put-snapshot"], stdin_data=json.dumps(snap1))[0] == 0
+    assert _run_cli(["put-snapshot"], stdin_data=json.dumps(snap2))[0] == 0
+
+    rc, out, err = _run_cli(["get-snapshot", "--project-slug", "acme-shop", "--snapshot-id", "snap-100"])
+    assert rc == 0, err
+    got_snap = json.loads(out)
+    assert got_snap["snapshot_id"] == "snap-100"
+    assert got_snap["finops"]["conservation_drift_usd"] == 0.0
+    assert got_snap["published_at"] and got_snap["updated_at"]
+
+    rc, out, err = _run_cli(["get-snapshot", "acme-shop__snap-100"])
+    assert rc == 0, err
+    assert json.loads(out)["snapshot_id"] == "snap-100"
+
+    rc, out, err = _run_cli(["list-snapshots", "--project-slug", "acme-shop"])
+    assert rc == 0, err
+    snaps = json.loads(out)
+    assert [s["snapshot_id"] for s in snaps] == ["snap-100"]
+
 
 # ---------------------------------------------------------------------------
 # Spec, README, templates & skill coverage checks
@@ -576,7 +693,7 @@ def test_eval_fabrica_spec_and_firestore_docs_exist():
     assert spec_doc.exists() and "EVAL FÁBRICA" in spec_doc.read_text()
 
     readme = (ROOT / "config" / "firestore" / "README.md").read_text()
-    for collection in ("eval_analyses", "eval_clone_groups", "eval_agent_state", "eval_factory_overrides"):
+    for collection in ("eval_analyses", "eval_clone_groups", "eval_agent_state", "eval_factory_overrides", "eval_snapshots"):
         assert collection in readme
     for url_field in ("report_url", "snapshot_url", "diff_url"):
         assert url_field in readme

@@ -278,6 +278,8 @@ create_index eval_factory_overrides --field-config=field-path=status,order=ascen
 create_index eval_factory_overrides --field-config=field-path=project_slug,order=ascending \
   --field-config=field-path=status,order=ascending \
   --field-config=field-path=applied_at,order=descending
+create_index eval_snapshots --field-config=field-path=project_slug,order=ascending \
+  --field-config=field-path=published_at,order=descending
 bind_project "serviceAccount:$DASHBOARD_RUNTIME_SA" roles/datastore.viewer
 echo "datastore.viewer: $DASHBOARD_RUNTIME_SA (dashboard); datastore.user: VM SA (sync, eval agents)"
 if exists gcloud storage buckets describe "gs://$DATA_BUCKET" --project="$P"; then

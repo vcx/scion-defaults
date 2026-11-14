@@ -25,6 +25,9 @@ Usage:
   factory_store.py put-override --file override.json
   factory_store.py list-active-overrides [--project-slug SLUG] [--limit N]
   factory_store.py resolve-override [--override-id ID | ID] --status STATUS [--note TEXT]
+  factory_store.py put-snapshot --file snapshot.json
+  factory_store.py get-snapshot [--project-slug SLUG] [--snapshot-id ID | ID]
+  factory_store.py list-snapshots [--project-slug SLUG] [--limit N]
   factory_store.py --dry-run put-eval-run --file run.json   # print the request, write nothing
 """
 from __future__ import annotations
@@ -48,6 +51,7 @@ EVAL_ANALYSES = "eval_analyses"
 EVAL_CLONE_GROUPS = "eval_clone_groups"
 EVAL_AGENT_STATE = "eval_agent_state"
 EVAL_FACTORY_OVERRIDES = "eval_factory_overrides"
+EVAL_SNAPSHOTS = "eval_snapshots"
 MAX_WRITES_PER_COMMIT = 500
 API = "https://firestore.googleapis.com/v1"
 
@@ -56,6 +60,7 @@ EVAL_ANALYSIS_REQUIRED = ("analysis_id", "project_slug", "status")
 EVAL_CLONE_GROUP_REQUIRED = ("clone_group_id", "project_slug", "source_task_id")
 EVAL_AGENT_STATE_REQUIRED = ("project_slug", "governance_mode")
 EVAL_OVERRIDE_REQUIRED = ("override_id", "project_slug", "analysis_id", "target_scope", "status")
+EVAL_SNAPSHOT_REQUIRED = ("snapshot_id", "project_slug")
 
 ANALYSIS_STATUSES = (
     "drafting",
@@ -540,10 +545,15 @@ def validate_clone_group(group: dict[str, Any]) -> list[str]:
         problems.append("variants must be a non-empty list of objects")
     else:
         for idx, variant in enumerate(variants):
-            if not isinstance(variant, dict) or variant.get("clone_id") in (None, ""):
-                problems.append(f"variants[{idx}] must be an object with clone_id")
+            if isinstance(variant, dict) and variant.get("clone_id") not in (None, ""):
+                _validate_artifact_fields(
+                    variant,
+                    f"variants[{idx}].",
+                    problems,
+                    extra_fields=("transcript_uri", "transcript_proxy_path"),
+                )
             else:
-                _validate_artifact_fields(variant, f"variants[{idx}].", problems, extra_fields=("transcript_uri",))
+                problems.append(f"variants[{idx}] must be an object with clone_id")
     for field, allowed in (
         ("source_tracker_mode", TRACKER_MODES),
         ("triggered_by", CLONE_TRIGGERED_BY),
@@ -741,6 +751,133 @@ def resolve_override(
 
 
 # ---------------------------------------------------------------------------
+# Eval Fabrica v2: eval_snapshots
+# ---------------------------------------------------------------------------
+
+def snapshot_doc_id(project_slug: str, snapshot_id: str) -> str:
+    slug = str(project_slug).strip()
+    sid = str(snapshot_id).strip()
+    if sid.startswith(f"{slug}__"):
+        return sid
+    return f"{slug}__{sid}"
+
+
+def validate_snapshot(snapshot: dict[str, Any]) -> list[str]:
+    if not isinstance(snapshot, dict):
+        return ["snapshot must be a JSON object"]
+    problems = [f"missing required field {k}" for k in EVAL_SNAPSHOT_REQUIRED if snapshot.get(k) in (None, "")]
+    _validate_doc_id(snapshot.get("snapshot_id"), "snapshot_id", problems)
+    _validate_doc_id(snapshot.get("project_slug"), "project_slug", problems)
+    if snapshot.get("project_slug") and snapshot.get("snapshot_id"):
+        _validate_doc_id(
+            snapshot_doc_id(str(snapshot["project_slug"]), str(snapshot["snapshot_id"])),
+            "snapshot_doc_id",
+            problems,
+        )
+
+    finops = snapshot.get("finops")
+    if finops is not None:
+        if not isinstance(finops, dict):
+            problems.append("finops must be an object")
+        else:
+            for num_field in (
+                "total_cost_usd",
+                "productive_cost_usd",
+                "rework_cost_usd",
+                "heartbeat_tax_usd",
+                "conservation_drift_usd",
+            ):
+                val = finops.get(num_field)
+                if val is not None and not _is_number(val):
+                    problems.append(f"finops.{num_field} must be a number")
+            if all(
+                _is_number(finops.get(k))
+                for k in ("total_cost_usd", "productive_cost_usd", "rework_cost_usd", "heartbeat_tax_usd")
+            ):
+                drift = abs(
+                    float(finops["total_cost_usd"])
+                    - (
+                        float(finops["productive_cost_usd"])
+                        + float(finops["rework_cost_usd"])
+                        + float(finops["heartbeat_tax_usd"])
+                    )
+                )
+                if round(drift, 6) > 0.000001:
+                    problems.append(f"finops violates conservation law (drift={drift:.6f})")
+
+    traj_sum = snapshot.get("trajectories_summary")
+    if traj_sum is not None and not isinstance(traj_sum, (dict, list)):
+        problems.append("trajectories_summary must be an object or list")
+
+    for map_field in ("conservation_check", "agents_summary", "system_summary"):
+        val = snapshot.get(map_field)
+        if val is not None and not isinstance(val, dict):
+            problems.append(f"{map_field} must be an object")
+
+    refs = snapshot.get("transcript_refs")
+    if refs is not None:
+        if not isinstance(refs, list):
+            problems.append("transcript_refs must be a list of objects")
+        else:
+            for idx, ref in enumerate(refs):
+                if not isinstance(ref, dict):
+                    problems.append(f"transcript_refs[{idx}] must be an object")
+                elif "proxy_url" in ref:
+                    _validate_artifact_url(ref.get("proxy_url"), f"transcript_refs[{idx}].proxy_url", problems)
+
+    return problems
+
+
+def put_snapshot(store: FirestoreStore, snapshot: dict[str, Any]) -> None:
+    problems = validate_snapshot(snapshot)
+    if problems:
+        raise ValueError("; ".join(problems))
+    doc_id = snapshot_doc_id(str(snapshot["project_slug"]), str(snapshot["snapshot_id"]))
+    write = _build_upsert_write(
+        store,
+        EVAL_SNAPSHOTS,
+        doc_id,
+        snapshot,
+        created_field="published_at",
+        updated_field="updated_at",
+    )
+    store.commit([write])
+
+
+def get_snapshot(store: FirestoreStore, project_slug_or_doc_id: str, snapshot_id: str | None = None) -> dict[str, Any] | None:
+    if snapshot_id:
+        if not _DOC_ID.fullmatch(str(project_slug_or_doc_id)):
+            raise ValueError("project_slug must be a valid document ID")
+        if not _DOC_ID.fullmatch(str(snapshot_id)):
+            raise ValueError("snapshot_id must be a valid document ID")
+        doc_id = snapshot_doc_id(project_slug_or_doc_id, snapshot_id)
+    else:
+        if not project_slug_or_doc_id or not _DOC_ID.fullmatch(str(project_slug_or_doc_id)):
+            raise ValueError("snapshot document ID must be a valid document ID")
+        doc_id = str(project_slug_or_doc_id)
+    return store.get_document(EVAL_SNAPSHOTS, doc_id)
+
+
+def list_snapshots(
+    store: FirestoreStore,
+    project_slug: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    filters: list[tuple[str, str, Any]] = []
+    if project_slug:
+        filters.append(("project_slug", "EQUAL", project_slug))
+    query: dict[str, Any] = {
+        "from": [{"collectionId": EVAL_SNAPSHOTS}],
+        "orderBy": [{"field": {"fieldPath": "published_at"}, "direction": "DESCENDING"}],
+        "limit": limit,
+    }
+    where = _where_filter(filters)
+    if where:
+        query["where"] = where
+    return store.run_query(query)
+
+
+# ---------------------------------------------------------------------------
 # Control State (written by watchdog)
 # ---------------------------------------------------------------------------
 
@@ -862,6 +999,19 @@ def main(argv: list[str] | None = None) -> int:
     p_res_ovr.add_argument("--status", required=True, choices=OVERRIDE_RESOLVE_STATUSES)
     p_res_ovr.add_argument("--note", help="optional resolution note")
 
+    p_put_snap = sub.add_parser("put-snapshot", help="record or update an eval_snapshots document (JSON object)")
+    p_put_snap.add_argument("--file", help="path to a JSON file (default: stdin)")
+
+    p_get_snap = sub.add_parser("get-snapshot", help="fetch an eval_snapshots document by project_slug and snapshot_id (or doc ID)")
+    p_get_snap.add_argument("first_pos", nargs="?", metavar="PROJECT_OR_DOC_ID")
+    p_get_snap.add_argument("second_pos", nargs="?", metavar="SNAPSHOT_ID")
+    p_get_snap.add_argument("--project-slug")
+    p_get_snap.add_argument("--snapshot-id")
+
+    p_list_snap = sub.add_parser("list-snapshots", help="list eval_snapshots documents")
+    p_list_snap.add_argument("--project-slug")
+    p_list_snap.add_argument("--limit", type=int, default=20)
+
     args = parser.parse_args(argv)
 
     try:
@@ -919,6 +1069,24 @@ def main(argv: list[str] | None = None) -> int:
             if not args.dry_run:
                 print("resolved", file=sys.stderr)
             return 0
+        elif args.cmd == "put-snapshot":
+            put_snapshot(store, _read_json_arg(args.file))
+            if not args.dry_run:
+                print("recorded", file=sys.stderr)
+            return 0
+        elif args.cmd == "get-snapshot":
+            if args.project_slug and (args.snapshot_id or args.first_pos):
+                sid = args.snapshot_id or args.first_pos
+                result = get_snapshot(store, args.project_slug, sid)
+            elif args.first_pos and args.second_pos:
+                result = get_snapshot(store, args.first_pos, args.second_pos)
+            else:
+                doc_or_sid = args.snapshot_id or args.first_pos
+                if not doc_or_sid:
+                    raise ValueError("missing snapshot_id (pass --project-slug SLUG --snapshot-id ID or SLUG__ID)")
+                result = get_snapshot(store, doc_or_sid)
+        elif args.cmd == "list-snapshots":
+            result = list_snapshots(store, args.project_slug, args.limit)
         else:
             raise ValueError(f"unknown command: {args.cmd}")
 

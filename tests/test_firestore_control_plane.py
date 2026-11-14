@@ -146,6 +146,7 @@ def test_compiled_starter_kit_is_serverless_firestore(tmp_path):
         "eval_analyses",
         "eval_clone_groups",
         "eval_factory_overrides",
+        "eval_snapshots",
     }
     assert "if false" in (out / "config" / "firestore" / "firestore.rules").read_text()
 

@@ -1740,6 +1740,14 @@ FIRESTORE_INDEXES = {
                 {"fieldPath": "applied_at", "order": "DESCENDING"},
             ],
         },
+        {
+            "collectionGroup": "eval_snapshots",
+            "queryScope": "COLLECTION",
+            "fields": [
+                {"fieldPath": "project_slug", "order": "ASCENDING"},
+                {"fieldPath": "published_at", "order": "DESCENDING"},
+            ],
+        },
     ],
     "fieldOverrides": [],
 }
