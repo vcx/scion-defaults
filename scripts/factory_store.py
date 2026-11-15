@@ -82,9 +82,12 @@ GOVERNANCE_MODES = ("autonomous", "human_approval", "manual")
 OVERRIDE_SCOPES = ("project_settings", "template", "agent_patch", "schedule")
 OVERRIDE_STATUSES = ("active", "promoted_to_git", "rolled_back", "expired")
 OVERRIDE_RESOLVE_STATUSES = ("promoted_to_git", "rolled_back", "expired")
+CHECKPOINT_KINDS = ("genesis", "commit", "post_commit")
 ARTIFACT_URL_FIELDS = ("report_url", "snapshot_url", "diff_url")
 
 _DOC_ID = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
+_LEGACY_WALLCLOCK_SNAP_RE = re.compile(r"^snap-\d{8}T\d{6}Z-[0-9a-f]+$", re.IGNORECASE)
+_BARE_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -461,12 +464,20 @@ def validate_analysis(analysis: dict[str, Any]) -> list[str]:
     if status not in (None, "") and status not in ANALYSIS_STATUSES:
         problems.append(f"status must be one of {', '.join(ANALYSIS_STATUSES)}")
     created_by = analysis.get("created_by")
-    if created_by not in (None, "") and created_by not in ANALYSIS_CREATED_BY:
-        problems.append(f"created_by must be one of {', '.join(ANALYSIS_CREATED_BY)}")
+    if created_by not in (None, "") and created_by not in ANALYSIS_CREATED_BY and not str(created_by).startswith("eval-"):
+        problems.append(f"created_by must be one of {', '.join(ANALYSIS_CREATED_BY)} or eval-<slug>")
     for list_field in ("task_ids", "eval_run_ids"):
         val = analysis.get(list_field)
         if val is not None and (not isinstance(val, list) or not all(isinstance(item, str) for item in val)):
             problems.append(f"{list_field} must be a list of strings")
+    tasks_ctx = analysis.get("tasks_context")
+    if tasks_ctx is not None:
+        if not isinstance(tasks_ctx, list) or not all(isinstance(tc, dict) for tc in tasks_ctx):
+            problems.append("tasks_context must be a list of objects")
+        else:
+            for idx, tc in enumerate(tasks_ctx):
+                if tc.get("title") and _BARE_UUID_RE.fullmatch(str(tc["title"]).strip()):
+                    problems.append(f"tasks_context[{idx}].title must be human-readable, not a bare UUID")
     action_log = analysis.get("action_log")
     if action_log is not None and (not isinstance(action_log, list) or not all(isinstance(a, dict) for a in action_log)):
         problems.append("action_log must be a list of objects")
@@ -550,10 +561,12 @@ def validate_clone_group(group: dict[str, Any]) -> list[str]:
                     variant,
                     f"variants[{idx}].",
                     problems,
-                    extra_fields=("transcript_uri", "transcript_proxy_path"),
+                    extra_fields=("transcript_uri", "transcript_proxy_path", "walgit_branch_url", "commit_url"),
                 )
             else:
                 problems.append(f"variants[{idx}] must be an object with clone_id")
+    if group.get("source_task_title") and _BARE_UUID_RE.fullmatch(str(group["source_task_title"]).strip()):
+        problems.append("source_task_title must be human-readable, not a bare UUID")
     for field, allowed in (
         ("source_tracker_mode", TRACKER_MODES),
         ("triggered_by", CLONE_TRIGGERED_BY),
@@ -563,7 +576,7 @@ def validate_clone_group(group: dict[str, Any]) -> list[str]:
         val = group.get(field)
         if val not in (None, "") and val not in allowed:
             problems.append(f"{field} must be one of {', '.join(allowed)}")
-    _validate_artifact_fields(group, "", problems)
+    _validate_artifact_fields(group, "", problems, extra_fields=("base_commit_url",))
     artifacts = group.get("artifacts")
     if isinstance(artifacts, dict):
         _validate_artifact_fields(artifacts, "artifacts.", problems)
@@ -762,48 +775,100 @@ def snapshot_doc_id(project_slug: str, snapshot_id: str) -> str:
     return f"{slug}__{sid}"
 
 
+def _validate_finops_lens(finops: Any, label: str, problems: list[str]) -> None:
+    if finops is None:
+        return
+    if not isinstance(finops, dict):
+        problems.append(f"{label} must be an object")
+        return
+    for num_field in (
+        "total_cost_usd",
+        "productive_cost_usd",
+        "rework_cost_usd",
+        "heartbeat_tax_usd",
+        "conservation_drift_usd",
+    ):
+        val = finops.get(num_field)
+        if val is not None and not _is_number(val):
+            problems.append(f"{label}.{num_field} must be a number")
+    if all(
+        _is_number(finops.get(k))
+        for k in ("total_cost_usd", "productive_cost_usd", "rework_cost_usd", "heartbeat_tax_usd")
+    ):
+        drift = abs(
+            float(finops["total_cost_usd"])
+            - (
+                float(finops["productive_cost_usd"])
+                + float(finops["rework_cost_usd"])
+                + float(finops["heartbeat_tax_usd"])
+            )
+        )
+        if round(drift, 6) > 0.000001:
+            problems.append(f"{label} violates conservation law (drift={drift:.6f})")
+
+
 def validate_snapshot(snapshot: dict[str, Any]) -> list[str]:
     if not isinstance(snapshot, dict):
         return ["snapshot must be a JSON object"]
     problems = [f"missing required field {k}" for k in EVAL_SNAPSHOT_REQUIRED if snapshot.get(k) in (None, "")]
-    _validate_doc_id(snapshot.get("snapshot_id"), "snapshot_id", problems)
+    sid = snapshot.get("snapshot_id")
+    _validate_doc_id(sid, "snapshot_id", problems)
+    if sid and _LEGACY_WALLCLOCK_SNAP_RE.fullmatch(str(sid)):
+        problems.append(
+            "snapshot_id must be a deterministic checkpoint ID (genesis, <git_sha8>, or post-<head_sha8>), "
+            "not a wall-clock snap-<timestamp> ID"
+        )
     _validate_doc_id(snapshot.get("project_slug"), "project_slug", problems)
-    if snapshot.get("project_slug") and snapshot.get("snapshot_id"):
+    if snapshot.get("project_slug") and sid:
         _validate_doc_id(
-            snapshot_doc_id(str(snapshot["project_slug"]), str(snapshot["snapshot_id"])),
+            snapshot_doc_id(str(snapshot["project_slug"]), str(sid)),
             "snapshot_doc_id",
             problems,
         )
 
-    finops = snapshot.get("finops")
-    if finops is not None:
-        if not isinstance(finops, dict):
-            problems.append("finops must be an object")
+    ckind = snapshot.get("checkpoint_kind")
+    if ckind not in (None, "") and ckind not in CHECKPOINT_KINDS:
+        problems.append(f"checkpoint_kind must be one of {', '.join(CHECKPOINT_KINDS)}")
+
+    cidx = snapshot.get("checkpoint_index")
+    if cidx is not None and (not _is_int(cidx) or cidx < 1):
+        problems.append("checkpoint_index must be a positive integer (>= 1)")
+
+    _validate_finops_lens(snapshot.get("finops"), "finops", problems)
+    _validate_finops_lens(snapshot.get("delta_finops"), "delta_finops", problems)
+    _validate_finops_lens(snapshot.get("cumulative_finops"), "cumulative_finops", problems)
+
+    df = snapshot.get("delta_finops")
+    cf = snapshot.get("cumulative_finops")
+    if isinstance(df, dict) and isinstance(cf, dict):
+        if _is_number(df.get("total_cost_usd")) and _is_number(cf.get("total_cost_usd")):
+            if float(df["total_cost_usd"]) - float(cf["total_cost_usd"]) > 0.000001:
+                problems.append("delta_finops.total_cost_usd cannot exceed cumulative_finops.total_cost_usd")
+
+    prov = snapshot.get("commit_provenance")
+    if prov is not None:
+        if not isinstance(prov, dict):
+            problems.append("commit_provenance must be an object")
         else:
-            for num_field in (
-                "total_cost_usd",
-                "productive_cost_usd",
-                "rework_cost_usd",
-                "heartbeat_tax_usd",
-                "conservation_drift_usd",
-            ):
-                val = finops.get(num_field)
-                if val is not None and not _is_number(val):
-                    problems.append(f"finops.{num_field} must be a number")
-            if all(
-                _is_number(finops.get(k))
-                for k in ("total_cost_usd", "productive_cost_usd", "rework_cost_usd", "heartbeat_tax_usd")
-            ):
-                drift = abs(
-                    float(finops["total_cost_usd"])
-                    - (
-                        float(finops["productive_cost_usd"])
-                        + float(finops["rework_cost_usd"])
-                        + float(finops["heartbeat_tax_usd"])
-                    )
+            _validate_artifact_fields(prov, "commit_provenance.", problems, extra_fields=("repo_url", "commit_url"))
+
+    tbreak = snapshot.get("tasks_breakdown")
+    if tbreak is not None:
+        if not isinstance(tbreak, list):
+            problems.append("tasks_breakdown must be a list of objects")
+        else:
+            for idx, item in enumerate(tbreak):
+                if not isinstance(item, dict):
+                    problems.append(f"tasks_breakdown[{idx}] must be an object")
+                    continue
+                if item.get("title") and _BARE_UUID_RE.fullmatch(str(item["title"]).strip()):
+                    problems.append(f"tasks_breakdown[{idx}].title must be human-readable, not a bare UUID")
+                _validate_artifact_fields(
+                    item,
+                    f"tasks_breakdown[{idx}].",
+                    problems,
+                    extra_fields=("farmtable_url", "walgit_branch_url", "transcript_proxy_url"),
                 )
-                if round(drift, 6) > 0.000001:
-                    problems.append(f"finops violates conservation law (drift={drift:.6f})")
 
     traj_sum = snapshot.get("trajectories_summary")
     if traj_sum is not None and not isinstance(traj_sum, (dict, list)):
@@ -833,13 +898,17 @@ def put_snapshot(store: FirestoreStore, snapshot: dict[str, Any]) -> None:
     if problems:
         raise ValueError("; ".join(problems))
     doc_id = snapshot_doc_id(str(snapshot["project_slug"]), str(snapshot["snapshot_id"]))
+    payload = dict(snapshot)
+    if payload.get("checkpoint_ts") in (None, ""):
+        payload["checkpoint_ts"] = payload.get("published_at") or "REQUEST_TIME"
     write = _build_upsert_write(
         store,
         EVAL_SNAPSHOTS,
         doc_id,
-        snapshot,
+        payload,
         created_field="published_at",
         updated_field="updated_at",
+        extra_time_fields=("checkpoint_ts", "last_verified_at"),
     )
     store.commit([write])
 
@@ -868,13 +937,23 @@ def list_snapshots(
         filters.append(("project_slug", "EQUAL", project_slug))
     query: dict[str, Any] = {
         "from": [{"collectionId": EVAL_SNAPSHOTS}],
-        "orderBy": [{"field": {"fieldPath": "published_at"}, "direction": "DESCENDING"}],
+        "orderBy": [{"field": {"fieldPath": "checkpoint_ts"}, "direction": "ASCENDING"}],
         "limit": limit,
     }
     where = _where_filter(filters)
     if where:
         query["where"] = where
-    return store.run_query(query)
+    docs = store.run_query(query)
+    filtered = [
+        d for d in docs if not _LEGACY_WALLCLOCK_SNAP_RE.fullmatch(str(d.get("snapshot_id") or ""))
+    ]
+    filtered.sort(
+        key=lambda d: (
+            str(d.get("checkpoint_ts") or d.get("published_at") or ""),
+            int(d.get("checkpoint_index") or 0),
+        )
+    )
+    return filtered
 
 
 # ---------------------------------------------------------------------------

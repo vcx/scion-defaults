@@ -336,6 +336,67 @@ def test_validate_snapshot_rules_and_conservation_law():
     assert "conservation law" in problems
     assert "transcript_refs[0].proxy_url" in problems
 
+    # v2.1 commit-anchored checkpoint validation (Dual-Lens FinOps + provenance + human titles)
+    v21_snap = {
+        "snapshot_id": "379d7a38",
+        "project_slug": "acme-shop",
+        "checkpoint_index": 2,
+        "checkpoint_kind": "commit",
+        "checkpoint_ts": "2026-11-13T04:03:21Z",
+        "git_sha": "379d7a38bedc703938feaca945947221d428ea89",
+        "git_branch": "main",
+        "commit_provenance": {
+            "repo_label": "walgit/org/acme-shop",
+            "repo_url": "https://walgit.example.test/org/acme-shop",
+            "commit_url": "https://walgit.example.test/org/acme-shop/commit/379d7a38bedc703938feaca945947221d428ea89",
+            "commit_subject": "feat: implement serverless API",
+        },
+        "delta_finops": {
+            "total_cost_usd": 0.45,
+            "productive_cost_usd": 0.40,
+            "rework_cost_usd": 0.04,
+            "heartbeat_tax_usd": 0.01,
+            "conservation_drift_usd": 0.0,
+        },
+        "cumulative_finops": {
+            "total_cost_usd": 0.70,
+            "productive_cost_usd": 0.62,
+            "rework_cost_usd": 0.06,
+            "heartbeat_tax_usd": 0.02,
+            "conservation_drift_usd": 0.0,
+        },
+        "finops": {
+            "total_cost_usd": 0.70,
+            "productive_cost_usd": 0.62,
+            "rework_cost_usd": 0.06,
+            "heartbeat_tax_usd": 0.02,
+            "conservation_drift_usd": 0.0,
+        },
+        "tasks_breakdown": [
+            {
+                "task_id": "acc95814-0000-4000-8000-000000000003",
+                "short_id": "#acc95814",
+                "title": "Implement serverless HTTP API",
+                "description_excerpt": "Builds net/http handlers and datastore repositories with full test coverage.",
+                "farmtable_url": "https://farmtable.example.test/?collection=acme-shop&task=acc95814",
+                "walgit_branch_url": "https://walgit.example.test/org/acme-shop/tree/main",
+            }
+        ],
+    }
+    assert factory_store.validate_snapshot(v21_snap) == []
+
+    bad_v21 = copy.deepcopy(v21_snap)
+    bad_v21["snapshot_id"] = "snap-20261114T033145Z-5fc16e6a"
+    bad_v21["checkpoint_kind"] = "wallclock"
+    bad_v21["delta_finops"]["total_cost_usd"] = 0.99  # drift + exceeds cumulative
+    bad_v21["tasks_breakdown"][0]["title"] = "acc95814-0000-4000-8000-000000000003"
+    v21_problems = " | ".join(factory_store.validate_snapshot(bad_v21))
+    assert "wall-clock" in v21_problems
+    assert "checkpoint_kind" in v21_problems
+    assert "delta_finops violates conservation law" in v21_problems
+    assert "cannot exceed cumulative_finops" in v21_problems
+    assert "not a bare UUID" in v21_problems
+
 
 # ---------------------------------------------------------------------------
 # Dry-run CLI tests for all 10 new subcommands
@@ -681,6 +742,43 @@ def test_eval_fabrica_end_to_end_crud_with_emulator(fake_emulator, tmp_path):
     assert rc == 0, err
     snaps = json.loads(out)
     assert [s["snapshot_id"] for s in snaps] == ["snap-100"]
+
+    # v2.1 chronological `checkpoint_ts` ordering across genesis -> commit -> post_commit (inserted out-of-order)
+    for cp_payload in (
+        {
+            "snapshot_id": "post-379d7a38",
+            "project_slug": "chrono-shop",
+            "checkpoint_index": 3,
+            "checkpoint_kind": "post_commit",
+            "checkpoint_ts": "2026-11-13T04:09:35Z",
+            "delta_finops": {"total_cost_usd": 0.2, "productive_cost_usd": 0.2, "rework_cost_usd": 0.0, "heartbeat_tax_usd": 0.0},
+            "cumulative_finops": {"total_cost_usd": 1.0, "productive_cost_usd": 1.0, "rework_cost_usd": 0.0, "heartbeat_tax_usd": 0.0},
+        },
+        {
+            "snapshot_id": "genesis",
+            "project_slug": "chrono-shop",
+            "checkpoint_index": 1,
+            "checkpoint_kind": "genesis",
+            "checkpoint_ts": "2026-11-13T03:37:06Z",
+            "delta_finops": {"total_cost_usd": 0.3, "productive_cost_usd": 0.3, "rework_cost_usd": 0.0, "heartbeat_tax_usd": 0.0},
+            "cumulative_finops": {"total_cost_usd": 0.3, "productive_cost_usd": 0.3, "rework_cost_usd": 0.0, "heartbeat_tax_usd": 0.0},
+        },
+        {
+            "snapshot_id": "379d7a38",
+            "project_slug": "chrono-shop",
+            "checkpoint_index": 2,
+            "checkpoint_kind": "commit",
+            "checkpoint_ts": "2026-11-13T04:03:21Z",
+            "delta_finops": {"total_cost_usd": 0.5, "productive_cost_usd": 0.5, "rework_cost_usd": 0.0, "heartbeat_tax_usd": 0.0},
+            "cumulative_finops": {"total_cost_usd": 0.8, "productive_cost_usd": 0.8, "rework_cost_usd": 0.0, "heartbeat_tax_usd": 0.0},
+        },
+    ):
+        assert _run_cli(["put-snapshot"], stdin_data=json.dumps(cp_payload))[0] == 0
+
+    rc, out, err = _run_cli(["list-snapshots", "--project-slug", "chrono-shop"])
+    assert rc == 0, err
+    chrono_snaps = json.loads(out)
+    assert [s["snapshot_id"] for s in chrono_snaps] == ["genesis", "379d7a38", "post-379d7a38"]
 
 
 # ---------------------------------------------------------------------------

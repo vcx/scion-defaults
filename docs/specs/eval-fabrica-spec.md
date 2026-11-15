@@ -1,262 +1,310 @@
-# Especificação Técnica e de Produto: `EVAL FÁBRICA` (Arquitetura v2)
+# Especificação Técnica e de Produto: `EVAL FÁBRICA` (Arquitetura v2.1)
 
 > [!IMPORTANT]
-> **Status:** Especificação Canônica v2 (Aprovada para Implementação) · **Ambiente de Referência:** `vcxa-scion-aa` (`tfhaa-main`, `EVAL_BQ_LOCATION=US`) + `vcxa-farmtable` (`farmtable-gcp`) · **Escopo Primário:** Fase 1 (`TAREFA` + `FÁBRICA` + `Análises` + Agentes `eval-<project-slug>` + `Clones de Tarefas` + Cloud Run Direct IAP + SSE Zero-Polling + Reconciliação Bruta) · **Fases Evolutivas:** Fase 2 (`PROCESSO`) e Fase 3 (`PRODUTO`).
+> **Status:** Especificação Canônica v2.1 (Aprovada para Implementação) · **Ambiente de Referência:** `vcxa-scion-aa` (`tfhaa-main`, `EVAL_BQ_LOCATION=US`) + `vcxa-farmtable` (`farmtable-gcp` / Spanner `vcx-spanner`) + Walgit (`walgit/scion-aa/<slug>`) · **Escopo v2.1:** Checkpoints Imutáveis Ancorados em Commits de Produto (Zero Duplicatas de Re-Run), Ledger FinOps Dual-Lens (`Δ deste Checkpoint` + `Acumulado até aqui`, Lei 4), Semântica Humana 100% para Tarefas (Títulos, Descrições, Critérios de Aceite e Correlação de Commits) e Arquitetura de Informação em 2 Níveis (`O1–O8`).
 
 ---
 
-## 1. Visão Geral, Diagnóstico Pós-Auditoria v1 e Princípios Arquiteturais v2
+## 1. Visão Geral, Diagnóstico Empírico (v1 → v2.0 → v2.1) e Princípios Arquiteturais
 
-### 1.1 Motivação da Arquitetura v2 e Diagnóstico Empírico (`vcxa-scion-aa` & `vcxa-farmtable`)
+### 1.1 Papel do `EVAL FÁBRICA` e Fundamentos Consolidados na v2.0
 
-O **`EVAL FÁBRICA`** transforma o `scion-eval` em um sistema fechado de **Observabilidade Analítica sobre Matéria-Prima Bruta, Experimentação Paralela (`Clones de Tarefas`) e Otimização Científica Governada** para fábricas multi-agente no Scion.
+O **`EVAL FÁBRICA`** transforma o `scion-eval` em um sistema fechado de **Observabilidade Analítica sobre Matéria-Prima Bruta, Time-Travel por Entregas Reais de Produto, Experimentação Paralela (`Clones de Tarefas`) e Otimização Científica Governada** para fábricas multi-agente no Scion.
 
-A auditoria técnica completa da implementação v1 em produção (`vcxa-scion-aa` + `vcxa-farmtable`) expôs cinco limitações estruturais que motivam esta **Arquitetura v2**:
-
-1. **Fragilidade Estrutural de Firebase Hosting + GCS Estático + CORS:**
-   - Na v1, servir uma SPA estática via Firebase Hosting (`vcxa-scion-aa.web.app`) fazendo `fetch` autenticado cross-origin contra `storage.googleapis.com` / `firebasestorage.googleapis.com` exigiu OAuth Client ID manual, popups/fragments de token (`GoogleAuthProvider.signInWithPopup` / `#access_token=`), regras de CORS no bucket GCS, quebras com URLs assinadas e escrita concorrente (*read-modify-write*) em arquivos JSON estáticos de índice (`registry.json`, `analyses/index.json`).
-   - **Solução v2:** **Serviço Único Fechado no Cloud Run protegido por Direct IAP (`--iap`)**, servindo UI + APIs REST + stream **Server-Sent Events (SSE)** na mesma origem (*same-origin*: zero Firebase Hosting, zero CORS, zero OAuth Client ID manual, zero URLs assinadas, zero polling no navegador).
-2. **Desconexão entre a Matéria-Prima Bruta e `scion_eval` (`rows_inspected = 0`):**
-   - Em `vcxa-scion-aa`, os coletores brutos do GCP já continham **29.668 linhas** em `scion_logs_linked._AllLogs` (incluindo **9.643 eventos OTel/hook** em `scion-agents`) e **37.316 spans** em `scion_trace_linked._AllSpans` (**2.426** `gen_ai.api.response` e **2.321** `agent.tool.result`), além de `scion_analytics` populado (`agent_logs_fact=9.838`, `trace_spans_fact=30.724`).
-   - Apesar disso, `scion_eval.task_eval_facts` tinha **0 linhas** porque:
-     1. O SQL v1 (`04_materialize_task_eval_facts.sql`) partia exclusivamente de `raw_task_trajectories WHERE task_id IS NOT NULL` (que estava vazio porque o shipper não havia drenado os containers) e aplicava uma heurística sintética fixa (`0.65` produtivo / `0.35` retrabalho e `0.0` de `heartbeat_tax_usd`);
-     2. O `AnalyticsDrainer` (`pkg/sciontool/telemetry/analytics_drainer.go`) chamava `GET <hub>/healthz` sem credencial contra o Hub em Cloud Run Direct IAP (recebendo `HTTP 404` do GFE), enquanto os hooks reais do Antigravity (`agy`) gravavam em `scion-agents` e `_AllSpans`.
-   - **Solução v2:** **Motor de Ingestão e Reconciliação sobre Matéria-Prima Bruta (`raw_reconciler.py`)**, partindo diretamente de `_AllLogs`, `_AllSpans`, `transcript_full.jsonl.gz`, diffs/commits do Walgit e transições brutas do Farm Table, regido por **3 Leis de Conservação** matemáticas.
-3. **Isolamento Cross-Project e Cross-Region entre `vcxa-farmtable` e `vcxa-scion-aa`:**
-   - O `farmtable-gcp` opera no projeto compartilhado `vcxa-farmtable` (`dual` backend: Spanner `vcx-spanner` + shadow Firestore), gravando `vcxa-farmtable.farmtable_analytics` na região **`us-central1`** (5 coleções, 34 tasks `completed`, 84 transições de estágio, 307 mudanças) e publicando eventos em `projects/vcxa-farmtable/topics/farmtable-task-events`.
-   - Já `vcxa-scion-aa` possui seus datasets (`scion_eval`, `scion_analytics`, `scion_logs_linked`, `scion_trace_linked`) na multi-região **`US`** (`EVAL_BQ_LOCATION=US`), tinha `vcxa-scion-aa.farmtable_analytics` vazio (`0` tabelas) e escutava o tópico errado (`projects/vcxa-scion-aa/topics/farmtable-task-events`).
-   - **Solução v2:** Ponte explícita **Cross-Project Pub/Sub** (assinando `projects/vcxa-farmtable/topics/farmtable-task-events`) + **Cross-Region BQ Reconciler** (lendo `vcxa-farmtable.farmtable_analytics` em `us-central1` com filtro temporal e replicando os fatos brutos reconciliados para `vcxa-scion-aa.scion_eval.ft_*_raw` em `US`, permitindo JOIN nativo em `US` com `_AllLogs` e `_AllSpans`).
-4. **Agente Único Ocioso (`eval-auditor`) vs. Isolamento de Domínio por Projeto:**
-   - Em `scion-eval-central`, um único agente genérico `eval-auditor` permaneceu sem ação (`reason=NO_TOOL_CALL`, `0` análises) e, em escala, misturaria regras de negócio de projetos distintos (`movr-flask`, `pingcrm`, `pitstop`, `micronaut-microservices-poc`).
-   - **Solução v2:** **1 Agente de Eval Dedicado por Projeto dentro de `scion-eval-central`** (`eval-<project-slug>` para cada projeto + `eval-fleet-global` para métricas agregadas de engenharia), operando em modo semiautônomo (`human_approval`), conversando exclusivamente via chat (`scion message`) com o `<project-slug>/lead` e via issues no Farm Table (`ft`), sob **Gate Estrito de Hipótese Forte** (`no_actionable_anomaly` quando saudável — proibido forçar recomendações).
+A fundação v2.0 resolveu quatro problemas estruturais da v1 que permanecem **inegociáveis na v2.1**:
+1. **Fim de Firebase Hosting + GCS Estático + CORS (`O1`):** Serviço único fechado no **Cloud Run protegido por Direct IAP (`--iap`)**, servindo SPA + REST + **Server-Sent Events (SSE)** na mesma origem (*same-origin*: zero Firebase Hosting, zero CORS, zero OAuth Client ID manual, zero URLs assinadas).
+2. **Zero Polling no Browser (`O2`):** Hidratação inicial única via `GET /api/v2/bootstrap` seguida exclusivamente por push reativo via `GET /api/v2/stream` (`EventSource` alimentado por `on_snapshot` do Firestore `(default)` e Pub/Sub).
+3. **Reconciliação sobre Matéria-Prima Bruta em `US` (`O3`):** Leitura direta das 5 fontes físicas brutas (`_AllLogs` incluindo `scion-agents`, `_AllSpans`, `transcript_full.jsonl.gz` via proxy GCS privado, commits/diffs do Walgit e eventos/snapshots cross-project de `vcxa-farmtable`) sem heurísticas sintéticas (`0.65 / 0.35` banido).
+4. **Isolamento `scion-eval-central` & Gate de Hipótese Forte (`O4`, `O5`, `O6`):** 1 agente dedicado `eval-<project-slug>` por projeto em `scion-eval-central` (+ `eval-fleet-global`), operando em `governance_mode = "human_approval"` com `EVAL_REQUIRE_STRONG_HYPOTHESIS=1` (silêncio operacional `no_actionable_anomaly` quando saudável) e comunicação estritamente *chat-only* com `<project-slug>/lead` + gates `type:decision` no Farm Table.
 
 ---
 
-### 1.2 Mapa de Evolução de Código v1 → v2 (Depreciação vs. Reuso)
+### 1.2 Diagnóstico Empírico Pós-Deploy v2.0 e Motivação da Evolução v2.1
 
-| Categoria | Caminhos nos Repositórios / Infraestrutura | Ação na v2 |
+A auditoria empírica sobre o serviço v2.0 em produção (`vcxa-scion-aa`, `vcxa-farmtable`, `vcx-spanner` e Walgit `scion-aa/*`) identificou quatro lacunas semânticas e de UX que impediam um engenheiro ou Product Owner de responder *"o que foi entregue em cada commit, quanto custou este avanço específico e quais tarefas humanas o compõem?"*:
+
+1. **Snapshots Falsos por Relógio de Parede (`12x $1.1785` Idênticos em vez de Commits Reais do Produto):**
+   - No Firestore `eval_snapshots` (`vcxa-scion-aa`), existiam **21 documentos**, sendo **12 para `movr-flask`** (`1` execução pré-sync de `$0.014438` + **11 clones idênticos de `$1.178467` → `$1.1785`** criados entre `03:31Z` e `03:55Z`, todos exibindo a pílula repetida `movr-flask@379d7a38be`).
+   - **Causas-raiz verificadas no código:**
+     1. `raw_reconciler.py` gerava IDs baseados em `utcnow()` (`snap-YYYYMMDDTHHMMSSZ-<hash>`), criando um novo documento a cada invocação CLI/PubSub/cron mesmo com **0 commits novos e 0 tarefas novas**;
+     2. A query em `walgit_commits_raw` não possuía `ORDER BY committed_at` e sobrescrevia `latest_sha` na ordem arbitrária do loop (`micronaut-microservices-poc` recebeu `8a997cd0` de `04:23Z` em vez do `HEAD` `fa5ec221` de `04:35Z`; `pingcrm` recebeu `0c274289` de `03:57Z` em vez do `HEAD` `5042e00c` de `04:36Z`);
+     3. `pull_walgit_commits()` buscava `/api/commits` (`subject`, `body`, `author`, `commit_date`) e `/api/commit/<sha>` (`stats[].path`), mas descartava `commit_subject` e a lista de arquivos alterados, exibindo na UI apenas a data do reconciliador (`published_at: 2026-11-14`) em vez da data real do commit do produto (`committed_at: 2026-11-13`).
+   - **Realidade física nos repositórios Walgit (`walgit/scion-aa/<slug>`):** Existem **21 commits reais produzidos pelos agentes Scion** (`movr-flask`: `1` commit `379d7a38` + fases pré/pós-commit com `7` tasks fechadas; `pingcrm`: `3` commits em `4` branches; `pitstop`: `7` commits em `5` branches; `micronaut-microservices-poc`: `10` commits em `7` branches).
+2. **FinOps Estático (`$1.1785` Congelado ao Trocar de Snapshot) — Falha Dupla Backend + Frontend:**
+   - **No Backend:** `raw_reconciler.py` gravava o custo acumulado da janela inteira (`7d`/`14d`) em `finops` de todos os snapshots e colapsava os `505` steps do agente `movr-flask/lead` (`03:25:04Z–04:09:35Z`, `$1.164029`) em uma única unidade de sessão, impedindo o fatiamento temporal entre checkpoints.
+   - **No Frontend:** `renderHeadlineStrip()` ignorava `selectedSnapshotDocId` (somando sempre `snaps[0]`) e os seletores de snapshot nunca re-renderizavam os KPIs superiores, mantendo `$1.1785` congelado até ao clicar no snapshot de `$0.0144`.
+   - **Solução v2.1:** Todo checkpoint passa a carregar **duas lentes FinOps matematicamente reconciliadas** em microdólares inteiros: **`delta_finops`** (*Custo deste Checkpoint $\Delta$*, gasto estritamente em $(T_{k-1}, T_k]$) e **`cumulative_finops`** (*Acumulado no Projeto até $T_k$*), regidas pela **Lei de Conservação 4** ($\sum_{k=1}^K \Delta_k \equiv \text{Acumulado}_K$, `drift == $0.000000`) e vinculadas dinamicamente a toda a UI.
+3. **Mistério de UUIDs Crus, Perda de Descrições do Farm Table e Bug no Botão de Transcript:**
+   - No Farm Table (`vcx-spanner` tabela `Tasks` e Firestore sombra `tasks` em `vcxa-farmtable`), **100% das 34 tarefas concluídas de build** possuem `Title` humano real e **33/34 possuem `Description` rica** (`80–230` caracteres, além de `AcceptanceCriteria` em `pingcrm`; apenas o épico guarda-chuva `ea941b74` de `movr-flask` tem `Description` vazia pois suas `6` subtarefas detalham o escopo).
+   - **Por que desapareceram na v2.0:**
+     1. `farmtable-extensions/internal/analytics/sync.go` lia `Description` e `AcceptanceCriteria` do Spanner, mas projetava apenas `BYTE_LENGTH(Description) AS description_len` em `tasks_snapshot`;
+     2. A Service Account do Cloud Run (`tfhaa-operator@vcxa-scion-aa.iam.gserviceaccount.com`) não possuía `roles/datastore.viewer` em `vcxa-farmtable` para ler a coleção sombra síncrona `tasks` do modo `dual`;
+     3. Todas as `21` linhas de `walgit_commits_raw` tinham `task_id = NULL` porque os workers commitaram em branches `feature/*` e `main` sem UUID na mensagem de commit;
+     4. Na UI (`web/app.js`), o UUID de 36 caracteres aparecia em negrito como título principal, o fallback `refs.find(...) || refs[0]` conectava erroneamente o transcript da tarefa `2b52b74e` a todas as outras `6` tarefas sem transcript, e o gráfico de contexto plotava `7` tarefas rotuladas falsamente como `Turn 1..7`.
+4. **Arquitetura de Informação Fragmentada:**
+   - Faltava uma hierarquia visual clara de cima para baixo conectando o **Repositório de Produto (Commits & Entregas)** ao **Custo Incremental vs. Acumulado**, às **Tarefas Humanas Entregues** e, finalmente, às **Decisões Semiautônomas do Agente de Eval**.
+
+---
+
+### 1.3 Mapa Consolidado de Evolução v2.0 → v2.1
+
+| Camada / Componente | Caminhos Alvo | Evolução Canônica na v2.1 |
 |---|---|---|
-| **Remover / Deprecar (Firebase Hosting + GCS Static Shell + CORS)** | - `scion-extensions/custom/eval-kit/firebase/{firebase.json,.firebaserc,auth-config.json,firestore.rules,storage.rules}`<br>- Lógica de Firebase Auth popup / fetches GCS CORS em `custom/eval-kit/shell/{index.html,styles.css,app.js}` e cópias em `custom/eval-kit/skills/eval-publish/resources/eval-kit/`<br>- Subcomandos `setup-firebase`, `deploy-firebase` e escrita de `analyses/index.json` / `registry.json` no GCS (`publish_analysis_to_gcs` em `eval_agent.py`)<br>- Configuração de CORS no bucket GCS em `custom/infra/setup-eval-fabrica.sh` (`L204-216`) e site ativo `vcxa-scion-aa.web.app` | **Remover do fluxo operacional.** Desativar Firebase Hosting do Eval Fábrica, limpar CORS do bucket `gs://<project>-eval-reports` (`--clear-cors`), eliminar leitura direta do GCS pelo browser e migrar 100% dos índices/estado de UI para Firestore `(default)`. |
-| **Evoluir / Estender (`custom/eval-fabrica/`)** | - **Novos módulos v2:** `eval_fabrica/web_service.py` (servidor Cloud Run Direct IAP + verificação JWT ES256 + SSE `on_snapshot`/PubSub + proxy de transcripts GCS) e `eval_fabrica/raw_reconciler.py` (ingestão e reconciliação das 5 matérias-primas brutas + leis de conservação)<br>- **Módulos evoluídos:** `eval_agent.py` (topologia `eval-<slug>` + `scion message` ao `lead` + Firestore-first sem `analyses/index.json`), `gcp_clients.py` (`EVAL_BQ_LOCATION=US` + cross-project FT BQ), `transcript_shipper.py`, `clone_orchestrator.py`, `llm_extractor.py`<br>- **SQL v2:** `custom/eval-fabrica/sql/01..05` reescritos para `US` sem heurística `0.65/0.35` | **Núcleo da implementação v2**, empacotado na imagem do serviço Cloud Run `eval-fabrica` e nos containers de agentes em `custom/antigravity/`. |
-| **Evoluir / Estender (`scion-defaults/` & `farmtable-extensions/`)** | - `scion-defaults/scripts/factory_store.py`: adicionar coleção `eval_snapshots` (`put-snapshot`, `get-snapshot`, `list-snapshots`) às 4 coleções `eval_*` existentes<br>- `scion-defaults/scripts/` & `custom/infra/setup-eval-fabrica.sh`: provisionar Cloud Run `--iap`, IAM Two-Gate, cross-project Pub/Sub e agentes `eval-<project-slug>` em `scion-eval-central`<br>- `farmtable-extensions/internal/analytics/` & `internal/events/pubsub_dispatcher.go`: garantir `Labels` + `RemoteData` no sync e publicação confiável em `farmtable-task-events` | **Reuso total e extensão limpa**, mantendo zero alteração intrusiva no código Go upstream de `cmd/sciontool/` e `pkg/telemetrycontract/`. |
+| **Ingestão Farm Table & IAM Cross-Project** | - `farmtable-extensions/internal/analytics/sync.go`<br>- IAM em `vcxa-farmtable` (`custom/infra/setup-eval-fabrica.sh`)<br>- `eval_fabrica/raw_reconciler.py` (`pull_farmtable_raw`) | 1. Projetar `description`, `acceptance_criteria` e `repo` em `tasks_snapshot` (`sync.go`).<br>2. Conceder `roles/datastore.viewer` em `vcxa-farmtable` para a SA do `eval-fabrica` / operador ler diretamente a coleção sombra síncrona `tasks` (`FARMTABLE_GCP_BACKEND=dual`) + fallback via API Direct IAP do `farmtable-gcp`.<br>3. Gerar `description_excerpt` limpo (com síntese automática das subtarefas para épicos sem corpo próprio), garantindo cobertura humana `100%` (`34/34`). |
+| **Commits de Produto Walgit & Checkpoints Idempotentes** | - `eval_fabrica/raw_reconciler.py` (`pull_walgit_commits`, `reconcile_window`)<br>- `custom/eval-fabrica/sql/01..05` | 1. Filtrar apenas commits da fábrica (`committed_at >= factory_epoch`, preservando `base_upstream_sha`), ordenados por `committed_at ASC, commit_sha ASC`, persistindo `commit_subject`, `commit_body`, `changed_paths` e `commit_url`.<br>2. Vincular commits às tarefas em 4 níveis (incluindo `feature/*`, merges e janela `[created_at, closed_at + 5m]` por worker).<br>3. Substituir snapshots por relógio (`snap-<ts>`) por **Checkpoints Determinísticos Endereçados por Conteúdo** (`<slug>__genesis`, `<slug>__<git_sha8>`, `<slug>__post-<head_sha8>`) e expurgar duplicatas legadas `snap-*`. |
+| **Fatiamento Atômico por Turno & Dual-Lens FinOps (Lei 4)** | - `eval_fabrica/raw_reconciler.py`<br>- `scion-defaults/scripts/factory_store.py`<br>- `eval_snapshots` & `eval_snapshot_facts` | 1. Precificar cada turno/step atômico em microdólares inteiros com seu timestamp físico $t(e)$ (sem colapsar sessões longas do `lead` em um único bloco).<br>2. Particionar a linha do tempo nos intervalos disjuntos $I_k = (T_{k-1}, T_k]$ e gravar `delta_finops` e `cumulative_finops` em cada `eval_snapshot`, validando a **Lei de Conservação 4** (`drift == $0.000000`). |
+| **UI 2-Níveis, Binding Dinâmico & Semântica Humana** | - `custom/eval-fabrica/web/{index.html,styles.css,app.js}`<br>- `eval_fabrica/{web_service.py,eval_agent.py,clone_orchestrator.py}` | 1. Scrubber visual de Commits com barras proporcionais de `Δ $` por commit, banner de proveniência Walgit e seletor de lente FinOps (`Δ deste Checkpoint` em destaque + `Acumulado até aqui`).<br>2. Re-render completo de KPIs, FinOps, tarefas, curva de contexto *per-turn* real e diffs ao trocar de checkpoint.<br>3. Zero UUID cru como título em tarefas, clones e análises; drawer expansível com Markdown completo + critérios de aceite + links diretos p/ Farm Table e Walgit; botão de transcript restrito a match exato de `task_id`. |
+| **Oráculos Independentes de Verificação (`O1–O8`)** | - `custom/eval-fabrica/tests/oracles/verify_v2_oracles.py` | Preservar `O1–O6` intactos e adicionar **`O7`** (Idempotência de Checkpoints por Commit, Zero Duplicatas, Lei 4 `∑Δ == Acumulado` e Binding Dinâmico no DOM) e **`O8`** (100% Cobertura de Títulos/Descrições, Correlação de Commits Walgit e Zero UUID Cru / Zero Transcript Falso no DOM). |
 
 ---
 
-### 1.3 Os Três Pilares Faseados e Arquitetura de Estado v2
-
-A mesma fundação de dados suporta três fases evolutivas sem quebra de schema:
+### 1.4 Os Três Pilares Faseados e Papéis Estritos das 4 Camadas de Infraestrutura
 
 | Fase | Pilar | Foco Principal | Entidades / Métricas-Chave |
 |---|---|---|---|
-| **Fase 1 (Escopo Primário v2)** | **`TAREFA`** | Eficiência, custo real reconciliado e qualidade na execução de cada tarefa individual (`TAREFA`) e seus `Clones de Tarefas`, atuando de forma governada na **`FÁBRICA`** (`Modelos`, `Templates`, `Distribuição`). | `task_id`, `parent_task_id`, `clone_group_id`, FinOps 3-buckets físicos (`productive`, `rework`, `heartbeat_tax` com `conservation_drift_usd == 0.0`), thrashing real, aderência a `AGENTS.md`, comparações A/B pareadas. |
+| **Fase 1 (Escopo Ativo v2.1)** | **`TAREFA` & `ENTREGAS`** | Eficiência, custo incremental ($\Delta$) e acumulado reconciliado por commit/tarefa, semântica humana completa e experimentação governada na **`FÁBRICA`** (`Modelos`, `Templates`, `Clones`). | Checkpoints `<slug>__<sha8>`, `delta_finops` + `cumulative_finops` (`Laws 1–4`, `drift == 0.0`), `title` + `description_excerpt` + commits Walgit, curva de contexto *per-turn*, `Clones de Tarefas` A/B. |
 | **Fase 2 (Extensível)** | **`PROCESSO`** | Saúde macro e fluxo organizacional da fábrica ao longo de múltiplas tarefas e sprints. | WIP vs `max_wip`, gargalos no DAG (`GetCriticalPath`, `GetBottlenecks`), tempo em fila (`ft_stage_transitions_raw`), `heartbeat_tax` agregado do `lead`. |
-| **Fase 3 (Extensível)** | **`PRODUTO`** | Qualidade funcional e runtime black-box do software produzido (SUT) segundo a pirâmide `L1–L5` ([`docs/verification-and-eval.md`](file:///usr/local/google/home/vixavier/sources/scion-workspace/scion-repos/scion-defaults/docs/verification-and-eval.md)). | Probes reais (`http`, `browser` CDP, `gcp-trace`, `gcp-monitoring`, `prom-query`) correlacionados por `commit_sha` / `task_id` em `eval_runs` e `eval_snapshots`. |
+| **Fase 3 (Extensível)** | **`PRODUTO`** | Qualidade funcional e runtime black-box do software produzido (SUT) segundo a pirâmide `L1–L5` ([`docs/verification-and-eval.md`](file:///usr/local/google/home/vixavier/sources/scion-workspace/scion-repos/scion-defaults/docs/verification-and-eval.md)). | Probes reais (`http`, `browser` CDP, `gcp-trace`, `gcp-monitoring`, `prom-query`) correlacionados ao `git_sha` do checkpoint em `eval_snapshots`. |
 
-#### Papéis Estritos das 4 Camadas de Infraestrutura na v2
-
-| Camada | Papel na Arquitetura v2 | Regras Inegociáveis | Artefatos / Coleções / Tabelas |
+| Camada | Papel na Arquitetura v2.1 | Regras Inegociáveis | Artefatos / Coleções / Tabelas |
 |---|---|---|---|
-| **1. Cloud Run Único (`eval-fabrica`) sob Direct IAP (`--iap`)** | **Único Front-Door Web, Push SSE & Proxy de Artefatos** | 1 único serviço multi-tenant por ambiente Scion (zero Cloud Run por projeto de build). `allUsers` em `roles/run.invoker` + ACL estrita em `roles/iap.httpsResourceAccessor`. Zero CORS, zero Firebase Hosting. | UI SPA same-origin (`/`, `/?view=factory`), REST (`/api/v2/*`), SSE (`/api/v2/stream`), Proxy GCS (`/api/v2/transcripts/*`), Webhook Pub/Sub (`/api/v2/events/*`). |
-| **2. Firestore `(default)` Native** | **Fonte Única da Verdade Operacional & de UI (Tempo Real)** | 100% do estado renderizado pela UI vive no Firestore. Atualizações empurradas via `on_snapshot` → SSE para os browsers conectados (zero `setInterval` polling). | `eval_analyses`, `eval_clone_groups`, `eval_agent_state`, `eval_factory_overrides`, `eval_snapshots` (+ `factory_agent_status`, `eval_runs`, `factory_fleet`). |
-| **3. GCS Privado (`gs://<project>-eval-reports`)** | **Armazenamento Frio de Blobs Brutos Pesados Imutáveis** | `uniform-bucket-level-access`, `public-access-prevention=enforced`, `cors=[]`. **Proibido** salvar índices mutáveis (`registry.json`, `analyses/index.json`) ou expor URLs diretas do GCS ao navegador. | `transcripts/<project_id>/<task_id>/<agent_id>/<incarnation_id>/transcript_full.jsonl.gz`, `diffs/<clone_group_id>/<clone_id>.patch.gz`. |
-| **4. BigQuery (`EVAL_BQ_LOCATION=US`)** | **Warehouse Analítico & Reconciliação da Matéria-Prima Bruta** | Datasets de Scion unificados em `US` (`scion_logs_linked`, `scion_trace_linked`, `scion_analytics`, `scion_eval`). Toda query exige filtro temporal explícito e `maximumBytesBilled`. | `_AllLogs`, `_AllSpans`, `ft_tasks_raw`, `ft_stage_transitions_raw`, `ft_changes_raw`, `walgit_commits_raw`, `raw_task_trajectories`, `task_agent_sessions`, `task_llm_extractions`, `task_eval_facts`. |
-
----
-
-### 1.4 Diagrama Geral da Arquitetura v2
+| **1. Cloud Run Único (`eval-fabrica`) sob Direct IAP (`--iap`)** | **Único Front-Door Web, Push SSE & Proxy de Artefatos** | 1 único serviço multi-tenant por ambiente Scion. `allUsers` em `roles/run.invoker` + ACL estrita em `roles/iap.httpsResourceAccessor` + verificação JWT ES256 interna. Zero CORS, zero Firebase Hosting. | SPA same-origin (`/`, `/?view=snapshot`, `/?view=factory`), REST (`/api/v2/*`), SSE (`/api/v2/stream`), Proxy GCS (`/api/v2/transcripts/*`), Webhook Pub/Sub (`/api/v2/events/*`). |
+| **2. Firestore `(default)` Native** | **Fonte Única da Verdade Operacional & de UI (Tempo Real)** | 100% do estado renderizado pela UI vive no Firestore. Checkpoints são idempotentes por commit (`<slug>__<sha8>`). Atualizações chegam via `on_snapshot` → SSE (zero `setInterval`). | `eval_snapshots`, `eval_analyses`, `eval_clone_groups`, `eval_agent_state`, `eval_factory_overrides` (+ `factory_agent_status`, `eval_runs`). |
+| **3. GCS Privado (`gs://<project>-eval-reports`)** | **Armazenamento Frio de Blobs Brutos Pesados Imutáveis** | `uniform-bucket-level-access`, `public-access-prevention=enforced`, `cors=[]`. **Proibido** salvar índices mutáveis (`registry.json`, `analyses/index.json`) ou expor URLs do GCS ao browser. | `transcripts/<project_id>/<task_id>/<agent_id>/<incarnation_id>/transcript_full.jsonl.gz`, `diffs/<clone_group_id>/<clone_id>.patch.gz`. |
+| **4. BigQuery (`EVAL_BQ_LOCATION=US`)** | **Warehouse Analítico & Reconciliação da Matéria-Prima Bruta** | Datasets Scion unificados em `US`. Toda query exige filtro temporal explícito e `maximumBytesBilled`. | `_AllLogs`, `_AllSpans`, `ft_tasks_raw`, `ft_stage_transitions_raw`, `walgit_commits_raw`, `raw_task_trajectories`, `task_agent_sessions`, `task_llm_extractions`, `task_eval_facts`, `eval_snapshot_facts`, `reconciliation_ledger`. |
 
 ```mermaid
 flowchart TD
-    subgraph RAW ["1. Matéria-Prima Bruta (5 Fontes Físicas)"]
-        LOGS["Cloud Logging Linked (_AllLogs em US: scion-analytics + scion-agents + scion_hub)"]
+    subgraph RAW ["1. Matéria-Prima Bruta (5 Fontes Físicas Autoritativas)"]
+        LOGS["Cloud Logging Linked (_AllLogs em US: scion-analytics + scion-agents)"]
         SPANS["Cloud Trace Linked (_AllSpans em US: gen_ai.api.response + agent.tool.result)"]
         TRANS["GCS Privado (transcript_full.jsonl.gz via Stop hook + scion-tracker)"]
-        WALGIT["Walgit Direct IAP (commits, numstat diffs, clone branches, CI status)"]
-        FT_RAW["Farm Table (vcxa-farmtable Spanner/BQ us-central1 + Pub/Sub farmtable-task-events)"]
+        WALGIT["Walgit Direct IAP (commits reais da fábrica, subject, stats, branches)"]
+        FT_RAW["Farm Table (Spanner/Firestore dual tasks c/ title+description + BQ us-central1 + Pub/Sub)"]
     end
 
-    subgraph RECON ["2. Reconciliação & Warehouse Analítico (BigQuery US)"]
-        BRIDGE["Cross-Project Event & Cross-Region FT Reconciler (raw_reconciler.py)"]
-        BQ_US[("vcxa-scion-aa.scion_eval (US): ft_*_raw + raw_task_trajectories + task_eval_facts")]
-        BQML["Extração Implícita (BQML ML.GENERATE_TEXT / Vertex Gemini)"]
-        CONSERV["3 Leis de Conservação (Tokens, FinOps drift == 0.0, Tasks 1:1)"]
-        LOGS --> BQ_US
-        SPANS --> BQ_US
-        TRANS --> BQ_US
-        WALGIT --> BRIDGE
-        FT_RAW --> BRIDGE
-        BRIDGE --> BQ_US
-        BQ_US --> BQML --> BQ_US
-        BQ_US --> CONSERV
+    subgraph RECON ["2. Reconciliador Determinístico por Turno & Commit (BigQuery US)"]
+        TURN_SLICE["Fatiamento Atômico por Turno t(e) & Correlação Tarefa <-> Commit (4 Níveis)"]
+        BQ_US[("vcxa-scion-aa.scion_eval (US): ft_tasks_raw + walgit_commits_raw + task_eval_facts + eval_snapshot_facts")]
+        LAWS["4 Leis de Conservação (Tokens, FinOps 3-Buckets, Tasks 1:1, Checkpoints ∑Δ == Acumulado)"]
+        LOGS --> TURN_SLICE
+        SPANS --> TURN_SLICE
+        TRANS --> TURN_SLICE
+        WALGIT --> TURN_SLICE
+        FT_RAW --> TURN_SLICE
+        TURN_SLICE --> BQ_US --> LAWS
     end
 
-    subgraph CENTRAL ["3. Projeto Hub scion-eval-central (Agentes Dedicados)"]
+    subgraph CENTRAL ["3. Projeto Hub scion-eval-central (Auditores Semiautônomos)"]
         EVAL_P["1 Agente por Projeto: eval-<project-slug> (human_approval + strong_hypothesis=1)"]
-        EVAL_G["1 Agente Global: eval-fleet-global (métricas agregadas sem domínio)"]
-        CONSERV --> EVAL_P
-        CONSERV --> EVAL_G
+        EVAL_G["1 Agente Global: eval-fleet-global (métricas agregadas cross-project)"]
+        LAWS --> EVAL_P
+        LAWS --> EVAL_G
     end
 
-    subgraph BUILD ["4. Projetos de Build no Hub (ex: movr-flask, pingcrm, pitstop)"]
-        LEAD["<project-slug>/lead"]
-        WORKERS["Builders & Clones de Tarefas (workspaceMode: per-agent)"]
-        LEAD --> WORKERS
-    end
-
-    subgraph STORE_UI ["5. Estado Vivo & Front-Door Único Fechado (Zero Polling)"]
-        FS[("Firestore (default) Native: eval_analyses, eval_clone_groups, eval_agent_state, eval_factory_overrides, eval_snapshots")]
-        CR_IAP["Serviço Único Cloud Run (--iap + allUsers run.invoker + ES256 JWKS)"]
-        BROWSER["Browser Humano (vixavier.altostrat.com via EventSource SSE) & SAs (signJwt)"]
-        FS -->|"on_snapshot / PubSub fan-out"| CR_IAP
+    subgraph STORE_UI ["4. Checkpoints Idempotentes & Observatório Dual-Lens (Cloud Run --iap + SSE)"]
+        FS[("Firestore (default): eval_snapshots (<slug>__<sha8>), eval_analyses, eval_clone_groups, eval_agent_state, eval_factory_overrides")]
+        CR_IAP["Serviço Único Cloud Run (--iap + Two-Gate + ES256 JWKS)"]
+        BROWSER["UI 2-Níveis: Scrubber de Commits c/ Δ$ + Tarefas Humanas + Governança PO (SSE Zero-Polling)"]
+        LAWS -->|"Upsert idempotente por commit"| FS
+        EVAL_P -->|"Upsert estado & análises"| FS
+        EVAL_G -->|"Upsert análises globais"| FS
+        FS -->|"on_snapshot / broadcast SSE"| CR_IAP
         TRANS -.->|"Proxy streaming autenticado"| CR_IAP
-        CR_IAP <-->|"Same-Origin HTTPS + SSE (Zero CORS, Zero Polling)"| BROWSER
+        CR_IAP <-->|"Same-Origin HTTPS + SSE"| BROWSER
     end
-
-    EVAL_P <-->|"Chat-Only (scion message)"| LEAD
-    EVAL_P <-->|"Issues & Gate status:po-decision (ft)"| FT_RAW
-    EVAL_P -->|"Upsert estado & análises"| FS
-    EVAL_G -->|"Upsert análises de frota"| FS
-    BROWSER -->|"Aprovação Humana PO"| CR_IAP --> FS
 ```
 
 ---
 
-## 2. Serviço Único Cloud Run sob Direct IAP (`--iap`) e UI Zero-Polling (SSE)
+## 2. Segurança Cloud Run Direct IAP (`--iap`), APIs Same-Origin e Arquitetura de UI em 2 Níveis
 
-### 2.1 Arquitetura de Segurança: A Regra dos Dois Portões (Direct IAP)
+### 2.1 A Regra dos Três Portões (Cloud Run Direct IAP)
 
-O serviço Cloud Run **`eval-fabrica`** substitui integralmente o Firebase Hosting e qualquer acesso direto do navegador ao GCS ou ao Firestore. Seguindo o padrão canônico validado no ecossistema Scion ([`.agents/skills/cloudrun-direct-iap/SKILL.md`](file:///usr/local/google/home/vixavier/sources/scion-workspace/.agents/skills/cloudrun-direct-iap/SKILL.md) e [`iapauth.go`](file:///usr/local/google/home/vixavier/sources/scion-workspace/scion-repos/farmtable-extensions/internal/serverapp/iapauth.go)), toda requisição atravessa **três camadas de verificação**:
+O serviço Cloud Run **`eval-fabrica`** opera 100% fechado sob Direct IAP ([`.agents/skills/cloudrun-direct-iap/SKILL.md`](file:///usr/local/google/home/vixavier/sources/scion-workspace/.agents/skills/cloudrun-direct-iap/SKILL.md)):
 
-1. **Portão 1 — Cloud Run IAM (`roles/run.invoker`):**
-   - `allUsers` **DEVE** permanecer vinculado a `roles/run.invoker` (`--allow-unauthenticated`), juntamente com o IAP Service Agent (`service-<PROJECT_NUMBER>@gcp-sa-iap.iam.gserviceaccount.com`).
-   - *Motivo físico no GFE:* sem `allUsers` em `roles/run.invoker`, o Google Frontend rejeita o navegador com `HTTP 403` antes que o Direct IAP possa iniciar o redirecionamento interativo do Google Sign-In.
-2. **Portão 2 — Cloud Run Direct IAP (`--iap` + `roles/iap.httpsResourceAccessor`):**
-   - Habilitado diretamente no serviço (`gcloud beta run services update eval-fabrica --iap`).
-   - Apenas identidades explicitamente autorizadas recebem `roles/iap.httpsResourceAccessor` no recurso `cloud-run`:
-     - Humanos autorizados: `domain:vixavier.altostrat.com` e `user:admin@vixavier.altostrat.com` (parametrizados por ambiente);
-     - Service Accounts autorizadas: SA dos agentes/Hub (`tfhaa-main-agent@vcxa-scion-aa.iam.gserviceaccount.com`), SA do worker/scheduler (`eval-fabrica-sa@vcxa-scion-aa.iam.gserviceaccount.com`) e SA de push do Pub/Sub.
-   - Para chamadas programáticas (CLI `scion-eval`, agentes `eval-<slug>`, scripts de verificação e pushes cross-project), a Service Account possui **`roles/iam.serviceAccountTokenCreator` + `roles/iam.serviceAccountUser`** sobre si mesma e assina um JWT via `iamcredentials.googleapis.com/...:signJwt` com **`aud: "https://<eval-fabrica-url>/*"`**, enviado em `Authorization: Bearer <signed_jwt>`.
-3. **Portão 3 — Validação Criptográfica `X-Goog-IAP-JWT-Assertion` dentro do Container (`web_service.py`):**
-   - O processo HTTP valida **em 100% das rotas** (incluindo `/`, `/api/v2/*` e `/api/v2/stream`) o cabeçalho `X-Goog-IAP-JWT-Assertion` injetado pelo IAP contra o JWKS ES256 oficial do Google (`https://www.gstatic.com/iap/verify/public_key-jwk`):
-     - Verifica assinatura `ES256`, `iss == "https://cloud.google.com/iap"`, `aud` igual ao audience canônico do serviço Cloud Run (`IAP_EXPECTED_AUDIENCE`), `exp` e `iat` (tolerância de `30s`).
-     - **Separação Humano vs. Service Account:**
-       - **Humano no Browser** (`!email.endswith(".gserviceaccount.com")`): verifica pertença a `ALLOWED_IAP_DOMAINS` (`vixavier.altostrat.com`) ou `ALLOWED_IAP_USERS` (`admin@vixavier.altostrat.com`). Login instantâneo zero-token (sem tela de login secundária, sem popup OAuth).
-       - **Service Account** (`email.endswith(".gserviceaccount.com")`): nunca provisiona sessão humana; valida que `email` pertence à allowlist `AUTHORIZED_SA_EMAILS` (e, em rotas mutantes de webhook/admin, valida escopo da operação).
-     - **Trava Anti-Bypass em Produção:** Na inicialização, se `K_SERVICE` estiver definido (ambiente Cloud Run) e `EVAL_DEV_BYPASS_IAP` estiver ativo ou `IAP_EXPECTED_AUDIENCE` estiver vazio, o processo aborta imediatamente (`sys.exit(1)`). Qualquer requisição sem JWT válido retorna `HTTP 401 Unauthorized`.
+1. **Portão 1 — Cloud Run IAM (`roles/run.invoker`):** `allUsers` + IAP Service Agent (`service-<PROJECT_NUMBER>@gcp-sa-iap.iam.gserviceaccount.com`) vinculados a `roles/run.invoker` para permitir que o Google Frontend (GFE) inicie o fluxo OAuth do Direct IAP sem bloquear o browser com `403` prévio.
+2. **Portão 2 — Cloud Run Direct IAP (`--iap` + `roles/iap.httpsResourceAccessor`):** Concedido exclusivamente a humanos autorizados (`domain:vixavier.altostrat.com`, `user:admin@vixavier.altostrat.com`) e Service Accounts autorizadas (SA do Hub/agentes, SA do reconciliador/operador e SA de push Pub/Sub). Chamadas programáticas assinam JWT via IAM `signJwt` com `aud: "https://<eval-fabrica-url>/*"`.
+3. **Portão 3 — Verificação `X-Goog-IAP-JWT-Assertion` ES256 no Container (`web_service.py`):** Valida assinatura `ES256` contra `https://www.gstatic.com/iap/verify/public_key-jwk`, `iss`, `aud` (`IAP_EXPECTED_AUDIENCE`), `exp`/`iat`, separa humanos (`ALLOWED_IAP_DOMAINS` / `ALLOWED_IAP_USERS`) de Service Accounts (`AUTHORIZED_SA_EMAILS`) e aborta o processo (`sys.exit(1)`) se `K_SERVICE` estiver definido com bypass ativo.
 
 ---
 
-### 2.2 Contrato de APIs Same-Origin, Streaming SSE (Zero Polling) e Proxy GCS
+### 2.2 Contrato de APIs Same-Origin e Canal SSE (Zero Polling)
 
-O navegador carrega a interface e recebe atualizações em tempo real sobre uma única conexão persistente **Server-Sent Events (`EventSource`)**, eliminando qualquer `setInterval` ou polling HTTP.
-
-| Método & Rota | Autenticação | Papel Funcional | Fonte de Dados Backend |
+| Método & Rota | Autenticação | Papel Funcional na v2.1 | Fonte de Dados Backend |
 |---|---|---|---|
-| `GET /` | Humano IAP | Serve a SPA unificada (`Time Travel` de snapshots + aba `Factory Analyses`, Clones, Agentes `eval-<slug>` e Gates de Aprovação). | Assets estáticos empacotados dentro da imagem Docker do `eval-fabrica` (zero bucket público/Hosting). |
-| `GET /api/v2/me` | Humano / SA IAP | Retorna `{email, sub, domain, principal_type, server_time}` extraídos do `X-Goog-IAP-JWT-Assertion`. | Middleware IAP JWT em memória. |
-| `GET /api/v2/bootstrap?project=<slug\|all>` | Humano / SA IAP | Hidratação inicial única ao abrir a página: retorna projetos registrados, `eval_agent_state`, `eval_analyses`, `eval_clone_groups`, `eval_factory_overrides`, últimos `eval_snapshots` e `factory_agent_status`. | Leitura indexada no Firestore `(default)` Native. |
-| `GET /api/v2/stream?project=<slug\|all>` | Humano IAP (`EventSource`) | **Canal SSE Zero-Polling (`text/event-stream`)**: empurra mutações em tempo real assim que qualquer documento `eval_*` muda no Firestore ou um evento Pub/Sub chega. Envia `: keepalive` a cada `25s`. Suporta retomada via `Last-Event-ID`. | Watch `on_snapshot` gRPC/streaming do Firestore `(default)` no processo Cloud Run + fan-out em memória. |
-| `GET /api/v2/snapshots/<project_slug>/<snapshot_id>` | Humano / SA IAP | Carrega o documento detalhado de um snapshot específico para Time Travel (`trajectories`, `agents`, `system`, `conservation_check`). | Documento `eval_snapshots/<project_slug>__<snapshot_id>` no Firestore `(default)`. |
-| `GET /api/v2/transcripts/<project_slug>/<task_id>/<agent_id>/<incarnation_id>` | Humano / SA IAP | **Streaming Proxy Seguro do GCS**: lê `gs://<EVAL_GCS_BUCKET>/transcripts/.../transcript_full.jsonl.gz` usando a SA do Cloud Run, descomprime em stream (suportando `?offset=<step>&limit=<n>` ou `?format=raw_gz`) e entrega via HTTPS autenticado pelo IAP. | GCS Privado (`uniform-bucket-level-access`, `public-access-prevention=enforced`, `cors=[]`). |
-| `POST /api/v2/analyses/<analysis_id>/decision` | Humano IAP (PO) | Aprova (`approve`) ou rejeita (`reject`) uma análise em `awaiting_approval`, gravando `governance.approved_by = iap_user.email`, atualizando o gate `type:decision` no Farm Table e notificando `eval-<project_slug>`. | Transação Firestore `eval_analyses` + Farm Table API (`ft`) + Hub Message API. |
-| `POST /api/v2/events/farmtable` | SA IAP / PubSub Push | Recebe eventos em tempo real de `projects/vcxa-farmtable/topics/farmtable-task-events`, dispara reconciliação incremental da tarefa fechada/transicionada e acorda `eval-<project_slug>`. | `raw_reconciler.py` + `ScionHubClient.send_message` + fan-out SSE. |
-
-#### Regras de Engenharia para o Canal SSE no Cloud Run
-- Configurar o serviço Cloud Run com `--timeout=3600`, `--session-affinity` e cabeçalhos `Content-Type: text/event-stream; charset=utf-8`, `Cache-Control: no-cache, no-transform`, `X-Accel-Buffering: no`.
-- O listener do Firestore no backend mantém **1 único watch por coleção `eval_*`** por instância Cloud Run e faz broadcast assíncrono (`asyncio.Queue` por cliente conectado, filtrando por `project_slug` quando solicitado), evitando abrir $M$ conexões ao Firestore para $M$ abas abertas.
-- No frontend (`web/app.js`), **é proibido o uso de `setInterval` ou loops `setTimeout` para buscar dados**. Toda atualização após `GET /api/v2/bootstrap` ocorre exclusivamente pelos eventos SSE (`analysis_upserted`, `clone_group_upserted`, `agent_state_upserted`, `override_upserted`, `snapshot_upserted`).
+| `GET /` | Humano IAP | Serve a SPA v2.1 com **Arquitetura de Informação em 2 Níveis** (`/?view=snapshot` Time-Travel por Commits de Produto e `/?view=factory` Governança & Otimização da Fábrica). | Assets estáticos empacotados na imagem Docker (`web/{index.html,styles.css,app.js}`). |
+| `GET /api/v2/me` | Humano / SA IAP | Retorna `{email, sub, domain, principal_type, server_time}` extraídos do JWT ES256 do IAP. | Middleware `IAPVerifier` em memória. |
+| `GET /api/v2/bootstrap?project=<slug\|all>` | Humano / SA IAP | Hidratação única na abertura: retorna projetos, metadados de links externos (`walgit_base_url`, `walgit_owner`, `farmtable_base_url`), `eval_agent_state`, `eval_analyses` (enriquecidas com títulos de tarefas), `eval_clone_groups`, `eval_factory_overrides`, `eval_snapshots` (ordenados cronologicamente por `checkpoint_ts`) e `factory_agent_status`. | Leitura indexada no Firestore `(default)` Native (excluindo docs legados `snap-*`). |
+| `GET /api/v2/stream?project=<slug\|all>` | Humano IAP (`EventSource`) | **Canal SSE Zero-Polling (`text/event-stream`)**: entrega mutações em tempo real (`snapshot_upserted`, `snapshot_deleted`, `analysis_upserted`, `clone_group_upserted`, `agent_state_upserted`, `override_upserted`) + `: keepalive` a cada `25s`. | Multiplexador `FirestoreMultiplexWatcher` + broadcast em memória. |
+| `GET /api/v2/snapshots/<project_slug>/<snapshot_id>` | Humano / SA IAP | Retorna o documento completo do checkpoint `<project_slug>__<snapshot_id>` (`commit_provenance`, `delta_finops`, `cumulative_finops`, `tasks_breakdown`, `agents_summary`, `system_summary`, `conservation_check`). | Documento `eval_snapshots/<project_slug>__<snapshot_id>` no Firestore `(default)`. |
+| `GET /api/v2/transcripts/<project_slug>/<task_id>/<agent_id>/<incarnation_id>` | Humano / SA IAP | **Streaming Proxy Seguro do GCS**: descomprime `gs://<EVAL_GCS_BUCKET>/transcripts/.../transcript_full.jsonl.gz` em stream com paginação `?format=json&offset=<step>&limit=<n>` ou download `?format=raw_gz`. | GCS Privado (`uniform-bucket-level-access`, `public-access-prevention=enforced`, `cors=[]`). |
+| `POST /api/v2/analyses/<analysis_id>/decision` | Humano IAP (PO) | Aprova (`approve`) ou rejeita (`reject`) uma análise em `awaiting_approval`, gravando `governance.approved_by = iap_user.email`, atualizando o gate `type:decision` no Farm Table e notificando `eval-<project_slug>`. | Transação Firestore `eval_analyses` + Farm Table API + Hub Message API. |
+| `POST /api/v2/events/farmtable` | SA IAP / PubSub Push | Recebe eventos de `projects/vcxa-farmtable/topics/farmtable-task-events`, executa reconciliação idempotente por commit/checkpoint e aciona `eval-<project_slug>`. | `raw_reconciler.py` + `eval_agent.py` + fan-out SSE. |
 
 ---
 
-## 3. Ingestão sobre Matéria-Prima Bruta ("Rawest Material") & Leis de Conservação
+### 2.3 Arquitetura de Informação em 2 Níveis e Modelo Mental de 4 Faixas (UI v2.1)
 
-### 3.1 As 5 Fontes Brutas Autoritativas e Resolução Cross-Project / Cross-Region
+Para eliminar qualquer ambiguidade cognitiva entre *"entregas de código/tarefas do produto"* e *"governança científica da fábrica"*, a interface v2.1 organiza a experiência em **4 Faixas Progressivas de Cima para Baixo** compartilhadas entre duas superfícies claramente rotuladas (e sem crases/markdown literal vazando no HTML):
 
-Em `vcxa-scion-aa`, todos os datasets analíticos do Scion residem na multi-região **`US`** (`EVAL_BQ_LOCATION=US`), enquanto o dataset analítico do Farm Table reside em **`vcxa-farmtable.farmtable_analytics` (`us-central1`)**. O motor **`eval_fabrica/raw_reconciler.py`** elimina pontos cegos reconciliando diretamente as **5 fontes físicas mais brutas**:
+- **Superfície 1 — `Entregas & Time-Travel por Commit` (`/?view=snapshot` · Visão Padrão ao Selecionar um Projeto):** Observatório de engenharia do produto construído pelos agentes. Responde em segundos: *Quantos commits reais foram entregues? O que mudou em cada commit? Quanto custou este commit ($\Delta$) vs. o acumulado até ele? Quais tarefas humanas foram entregues e como os agentes pensaram?*
+- **Superfície 2 — `Governança & Otimização da Fábrica` (`/?view=factory` · Visão Padrão em `All Projects`):** Console operacional da frota `scion-eval-central`. Responde: *Os auditores dedicados estão saudáveis (`no_actionable_anomaly`)? Há alguma anomalia forte `S1–S5` aguardando aprovação do PO? Qual variante venceu nos Clones A/B e há algum override em observação de rollback?*
 
-| # | Fonte Física Bruta | Localização Exata (Ref: `vcxa-scion-aa` / `vcxa-farmtable`) | O que Extrai Fisicamente | Como Entra na Reconciliação (`US`) |
+```text
+┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ FAIXA 1: Topbar + Seletor de Projeto + Overview Strip Reativo ao Contexto / Checkpoint Ativo     │
+│ [Entregas & Time-Travel] [Governança da Fábrica] · Projeto: [pingcrm ▾] · SSE Live · PO IAP     │
+│ ┌──────────────────────┐ ┌──────────────────────────┐ ┌─────────────────────┐ ┌────────────────┐ │
+│ │ Checkpoint Ativo (Δ) │ │ Acumulado até o Commit   │ │ Entregas no Repo    │ │ Eval & Gate PO │ │
+│ │ Δ $0.0068 (3 turnos) │ │ $0.0184 · Drift $0.000000│ │ Commit #3/3 · 8 tsk │ │ Saudável · 0 PO│ │
+│ └──────────────────────┘ └──────────────────────────┘ └─────────────────────┘ └────────────────┘ │
+├──────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ FAIXA 2: Scrubber Interativo de Commits Reais do Produto (com Barras Proporcionais de Δ$)        │
+│ ┌──────────────────────────┐    ┌──────────────────────────┐    ┌──────────────────────────────┐ │
+│ │ #1 · 0c274289 (main/feat)│───▶│ #2 · 6bbe6632            │───▶│ #3 · 5042e00c [SELECIONADO]  │ │
+│ │ feat(domain,storage)...  │    │ feat(api,services)...    │    │ feat(jobs,deploy)...         │ │
+│ │ [████░░░░] Δ $0.0054     │    │ [█████░░░] Δ $0.0062     │    │ [██████░░] Δ $0.0068         │ │
+│ │ 13 Nov 03:57 · +3741/-0  │    │ 13 Nov 04:14 · +3060/-0  │    │ 13 Nov 04:36 · 11f +2061/-48 │ │
+│ └──────────────────────────┘    └──────────────────────────┘    └──────────────────────────────┘ │
+│ Proveniência: Product Repo: walgit/scion-aa/pingcrm@feature/jobs-and-serverless [Abrir Commit ↗] │
+│ Autor: pingcrm-worker-3 · Commitado em: 2026-11-13T04:36:13Z · Verificado em: 2026-11-15T...Z    │
+├──────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ FAIXA 3: FinOps Dual-Lens do Checkpoint Selecionado & Entregas de Tarefas Humanas                │
+│ ┌──────────────────────────────────────────────┐ ┌─────────────────────────────────────────────┐ │
+│ │ LENTE PRIMÁRIA: Custo deste Checkpoint (Δ)   │ │ LENTE SECUNDÁRIA: Acumulado até este Commit │ │
+│ │ $0.0068 (Prod $0.0065 | Rew $0.00 | HB $0.0003)│ │ $0.0184 (100% do projeto até T_3 · ∑Δ OK) │ │
+│ │ 3 tarefas entregues neste marco · 14 turnos  │ │ 8 tarefas concluídas acumuladas · Lei 4 PASS│ │
+│ └──────────────────────────────────────────────┘ └─────────────────────────────────────────────┘ │
+│ Tabela/Cards de Tarefas (Filtro: [Entregues neste Checkpoint (3)] | [Acumulado até aqui (8)]):   │
+│ • Implementar Cloud Run Jobs, Worker e Manifestos Serverless   [TASK] [COMPLETED] [@worker-3]    │
+│   #a1b2c3d4 · Resumo: Configura Dockerfile multi-stage, job de migração e manifesto Cloud Run... │
+│   Custo: $0.0065 (Prod $0.0065 · Rew $0.0000 · HB $0.0000) · Commit: 5042e00c (+2061/-48)        │
+│   [Expandir Descrição & Critérios] [Farm Table ↗] [Walgit Diff ↗] [Transcript JSONL (se existir)]│
+│ + Curva Real de Contexto Por Turno (Turn 1..M em I_k) & Checks de Aderência ao Protocolo         │
+├──────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ FAIXA 4: Resumo do Agente Semiautônomo (`eval-pingcrm`), Clones A/B & Gate de Decisão PO         │
+│ Status: no_actionable_anomaly (8 tarefas inspecionadas, 0 recomendações forçadas) -> [Ver Frota] │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Regras Obrigatórias de Binding Dinâmico e Higiene de UI (`web/app.js`)
+1. **Reatividade Total na Troca de Checkpoint:** Clicar em qualquer card do Scrubber de Commits, alterar `#snapshot-select` ou acionar `Older` / `Newer` **DEVE** chamar tanto `renderHeadlineStrip()` quanto `renderSnapshotView()`, atualizando imediatamente:
+   - Os cards `Custo deste Checkpoint (Δ)` (`delta_finops`) e `Acumulado até este Commit` (`cumulative_finops`);
+   - O banner de proveniência do repositório Walgit (`repo_label`, `git_branch`, `git_sha8`, `commit_subject`, `commit_author`, `committed_at` separado de `last_verified_at`, `+insertions / -deletions`, `changed_paths`);
+   - A lista de tarefas entregues naquele intervalo $I_k$ (com opção de alternar para todas as tarefas acumuladas até $T_k$);
+   - A curva SVG de tokens de cache **por turno real** dentro do checkpoint selecionado.
+2. **Proibição Absoluta de UUID Cru como Manchete Principal:** Em 100% das tabelas e cards (`#snap-tasks-tbody`, `eval_analyses`, `eval_clone_groups`), o elemento primário em destaque (`<strong>`) **DEVE** ser o `title` humano da tarefa, acompanhado do badge curto `#<task_id[:8]>` (ex.: `#c52bb746`), pílulas de `task_type` (`EPIC`, `TASK`, `BUG`, `DECISION`), `stage` (`COMPLETED`, `IN_REVIEW`, `WORKING`), `assignee`, `description_excerpt` e decomposição dos 3 buckets FinOps.
+3. **Integridade Estrita do Botão de Transcript (Fim do Fallback `|| refs[0]`):** O botão `Inspect Transcript` para uma tarefa `T` **SÓ** pode ser renderizado se existir referência real em `transcript_refs` cujo `task_id == T.task_id`. Quando não houver transcript individual da tarefa no GCS (ex.: tarefas rastreadas via `_AllSpans`/`_AllLogs` ou sessões agregadas do `lead`), a célula exibe explicitamente `Telemetria Spans/Logs` (e, se houver transcript de sessão do `lead` no projeto, oferece link secundário claramente identificado como `Session Transcript (@lead)`, jamais fingindo ser o transcript isolado daquela tarefa).
+
+---
+
+## 3. Checkpoints Ancorados em Commits Reais, Matéria-Prima Bruta & As 4 Leis de Conservação
+
+### 3.1 Definição de Engenharia: O Que É um `eval_snapshot` na v2.1
+
+Em termos de engenharia de software, um documento em `eval_snapshots` **NÃO é um log de execução do job reconciliador**. Um `eval_snapshot` é um **Marco Imutável de Entrega do Produto (*Product Deliverable Checkpoint*)**, endereçado deterministicamente pelo estado do repositório de código no Walgit e das tarefas entregues no Farm Table.
+
+Para cada projeto monitorado `<project_slug>`, o reconciliador constrói a sequência ordenada cronologicamente de checkpoints $C_1, C_2, \dots, C_K$ ($T_1 < T_2 < \dots < T_K$) usando **exatamente três tipos determinísticos (`checkpoint_kind`)**:
+
+| `checkpoint_kind` | Quando Existe | `snapshot_id` Determinístico | ID do Documento em `eval_snapshots` | Timestamp de Fronteira $T_k$ (`checkpoint_ts`) |
 |---|---|---|---|---|
-| **1** | **Cloud Logging `_AllLogs`** | `vcxa-scion-aa.scion_logs_linked._AllLogs` (`US`) | **Ambos** `scion-analytics` (`agent.usage`, `agent.lifecycle`) **e** `scion-agents` / `scion_hub` (eventos de hook OTel do `agy`/`sciontool`, turns, `NO_TOOL_CALL`, dispatches e erros de container). | Query direta em `US` com predicado obrigatório `` `timestamp` BETWEEN @w_start AND @w_end ``. |
-| **2** | **Cloud Trace / OTel `_AllSpans`** | `vcxa-scion-aa.scion_trace_linked._AllSpans` & `scion_analytics.trace_spans_fact` (`US`) | Spans brutos `agent.turn/<slug>`, `gen_ai.api.response/<model>` (tokens reais `input`/`output`/`cache`, modelo, latência `end_time - start_time`, `session_id`, `trace_id`) e `agent.tool.result/<tool>` (erros e status por ferramenta). | Query direta em `US` com predicado obrigatório `start_time BETWEEN @w_start AND @w_end`. Fonte primária de tokens/latência quando `agent.usage` ou transcript faltar! |
-| **3** | **Transcripts Brutos (`.jsonl.gz`)** | `gs://vcxa-scion-aa-eval-reports/transcripts/.../transcript_full.jsonl.gz` → `scion_eval.raw_task_trajectories` (`US`) | Raciocínio passo a passo, `step_type`, `tool_calls`, `tool_errors_count`, prompts, contexto e `trace_id` capturados no hook `Stop`/`session.idle` + `scion-tracker`. | `scion-eval transcript-ship` grava `.jsonl.gz` no GCS privado e insere steps incrementais em `scion_eval.raw_task_trajectories` (`US`). |
-| **4** | **Walgit Commits & Diffs** | `https://walgit-875766756321.us-central1.run.app/scion-aa/<slug>` (Direct IAP `signJwt`) | `commit_sha`, `parent_sha`, `branch` (`main` ou `task/<id>/clone-<k>`), `git diff --numstat` (linhas adicionadas/removidas, re-edição dos mesmos arquivos = *churn*), mensagens de commit com `task_id` e status de execução de testes. | `raw_reconciler.py` coleta commits novos por janela/branch e grava em `scion_eval.walgit_commits_raw` (`US`). |
-| **5** | **Transições Brutas do Farm Table** | `vcxa-farmtable.farmtable_analytics.{collections_dim, tasks_snapshot, stage_transitions_fact, changes_fact}` (`us-central1`) + `projects/vcxa-farmtable/topics/farmtable-task-events` | Ciclo de vida completo da `TAREFA` (`triage` → `accepted` → `working` → `in_review` → `completed`, regressões `in_review` → `working`, `Labels`, `RemoteData`, `ParentTaskId`, `AssigneeId`, timestamps exatos). | `raw_reconciler.py` consulta `vcxa-farmtable.farmtable_analytics` (`location="us-central1"`, janela `DATE(updated_at)`) e faz upsert em `vcxa-scion-aa.scion_eval.{ft_tasks_raw, ft_stage_transitions_raw, ft_changes_raw}` (`location="US"`). |
+| **`"genesis"`** *(Pré-Commit / Planejamento Inicial)* | Criado **somente se** existirem tarefas concluídas ou turnos reais de agentes estritamente anteriores ao primeiro commit Scion do projeto ($t < \text{committed\_at}(C_{\text{commit},1})$), ou enquanto o projeto tiver atividade/tarefas mas `0` commits Scion no Walgit. | `genesis` | **`<project_slug>__genesis`** *(ex.: `movr-flask__genesis`)* | Timestamp da última tarefa fechada antes do 1º commit (ex.: `2026-11-13T03:37:06Z` da task `#c52bb746` em `movr-flask`), ou do último turno pré-commit. |
+| **`"commit"`** *(Commit Real no Repositório do Produto)* | **1 checkpoint para cada commit real da fábrica** no repositório Walgit `walgit/scion-aa/<project_slug>` (`committed_at >= factory_epoch`, excluindo histórico upstream pré-existente do template base como `bd00b3e8`), ordenado por `committed_at ASC, commit_sha ASC`. | `<git_sha8>` *(primeiros 8 hex do SHA-1/SHA-256 do commit)* | **`<project_slug>__<git_sha8>`** *(ex.: `movr-flask__379d7a38`, `pingcrm__0c274289`, `pingcrm__6bbe6632`, `pingcrm__5042e00c`)* | $\max\big(\text{committed\_at}(C), \max_{\tau \in \text{grace}(C)} \text{closed\_at}(\tau)\big)$, onde $\text{grace}(C) = [\text{committed\_at}, \min(\text{committed\_at} + 60\text{s}, T_{\text{next}}))$, absorvendo o `ft task close` disparado logo após `git push` (ex.: `#acc95814` fechada `+10s` após `379d7a38`). |
+| **`"post_commit"`** *(Verificação / Fechamento Pós-Commit)* | Criado **somente se** existirem tarefas concluídas no Farm Table (ex.: QA E2E, revisão final, fechamento de épico) ou turnos produtivos de agentes **após** a fronteira do último commit $C_{\text{last}}$ ($t > T_{\text{commit,last}}$). Se um novo commit $C_{\text{new}}$ chegar depois, `post-<old_sha8>` é absorvido por `<project_slug>__<new_sha8>` e removido. | `post-<head_sha8>` | **`<project_slug>__post-<head_sha8>`** *(ex.: `movr-flask__post-379d7a38`)* | Timestamp do último fechamento de tarefa ou turno pós-commit (ex.: `2026-11-13T04:09:35Z` para as 5 tasks de verificação/épico de `movr-flask`). |
 
-> [!NOTE]
-> **Correção complementar de `scion-analytics` em Direct IAP:** Além de ler `_AllLogs` (`scion-agents`) e `_AllSpans` diretamente, o bootstrap em `custom/` configura o `AnalyticsDrainer` / hooks para não depender de `GET <hub>/healthz` não-autenticado em Hubs com Direct IAP, restaurando também a emissão de `agent.usage` nos novos turnos.
-
----
-
-### 3.2 Algoritmo de Reconciliação Determinística e Decomposição Física dos 3 Buckets
-
-Nenhuma constante arbitrária (como `0.65 / 0.35`) é permitida na v2. Cada chamada de modelo / turno reconciliado $u$ (unificando deduplicadamente `_AllSpans` `gen_ai.api.response`, `_AllLogs` `agent.usage`/`scion-agents` e `raw_task_trajectories` pela chave `(agent_id, session_id, trace_id, span_or_step_id)`) recebe seu custo físico `cost_usd(u)` (`reported_cost_micros / 1e6` ou cálculo exato via `scion_eval.model_pricing_dim` sobre `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens`) e é classificado deterministicamente:
-
-1. **Vínculo de Tarefa (`task_id`):**
-   - **Nível 1 (Sessão Explícita):** match `(agent_id, incarnation_id, session_id)` em `task_agent_sessions` com `u.ts BETWEEN claimed_at AND COALESCE(closed_at, CURRENT_TIMESTAMP())`;
-   - **Nível 2 (Commit / Branch Walgit):** match de `branch` (`task/<task_id>/...`) ou referência explícita ao `task_id` em `walgit_commits_raw` / `ft_changes_raw` pelo mesmo agente na janela;
-   - **Nível 3 (Janela de Estágio `working` no Farm Table):** interseção de `(project_slug, assignee_agent_id)` com intervalo `[entered_working_at, exited_working_at]` em `ft_stage_transitions_raw` (ou tarefa única ativa da coleção quando o builder opera sobre 1 task em `working`);
-   - **Nível 4 (Sem Tarefa Ativa / Acordada Ociosa):** turnos de cron/schedule onde nenhuma tarefa está vinculada e o agente encerra com `NO_TOOL_CALL` ou apenas checagem de fila vazia (`ft ready` / `scion-tracker` sem `claim`).
-2. **Classificação Física nos 3 Buckets FinOps:**
-   - **`heartbeat_tax_usd`:** `100%` do custo dos turnos classificados no Nível 4 (acordadas de heartbeat sem avanço nem mutação de tarefa). Quando atribuído ao nível de projeto/snapshot ou proporcionalizado sobre as tarefas ativas da janela, permanece explicitamente separado em `heartbeat_tax_usd`.
-   - **`rework_cost_usd`:** `100%` do custo dos turnos vinculados a uma `task_id` que ocorrem:
-     1. **Após uma transição regressiva de estágio** em `ft_stage_transitions_raw` (ex.: `in_review → working`, `in_qa → working`, `reopened`); **OU**
-     2. **Em ciclos consecutivos de falha de ferramenta/teste** (`agent.tool.result` com `status = ERROR` / exit code `!= 0` seguido de nova invocação corretiva no mesmo turno/sessão); **OU**
-     3. **Em reversão/reescrita do mesmo arquivo após falha de CI** detectada em `walgit_commits_raw`.
-   - **`productive_cost_usd`:** `100%` do custo dos demais turnos vinculados à `task_id` que conduzem a implementação, revisão aprovada e fechamento (`completed`).
+#### Garantias Estritas de Idempotência e Limpeza de Duplicatas Legadas
+1. **Zero Dependência de `utcnow()` no ID:** Como `snapshot_id` é puramente função do commit/marco (`genesis`, `<git_sha8>`, `post-<head_sha8>`), executar `scion-eval reconcile` $10$ vezes seguidas sem novos commits ou tarefas realiza **upsert in-place** nos mesmos $K$ documentos (atualizando apenas `last_verified_at` e `reconciliation_id`), gerando **zero snapshots duplicados**.
+2. **Filtro de Época da Fábrica (`factory_epoch`):** `pull_walgit_commits()` calcula `factory_epoch = MIN(ft_tasks.created_at) - INTERVAL 30 MINUTE` (com fallback para o primeiro span/log do projeto no Hub) para distinguir commits realizados pelos agentes Scion da história upstream herdada do repositório base clonado (registrando o SHA pai do primeiro commit Scion como `base_upstream_sha`).
+3. **Expurgo Automático de Legado `snap-*`:** Ao reconciliar um projeto `<slug>`, `raw_reconciler.py` remove do Firestore quaisquer documentos obsoletos cujo ID case com `^<slug>__snap-\d{8}T\d{6}Z-` (e qualquer `post-<old_sha8>` superado por novo commit), emitindo evento SSE `snapshot_deleted` quando aplicável.
 
 ---
 
-### 3.3 As 3 Leis de Conservação Obrigatórias
+### 3.2 As 5 Fontes Brutas Autoritativas, Enriquecimento Farm Table & Correlação Tarefa ↔ Commit
 
-Todo job de reconciliação calcula e grava um registro de auditoria em `scion_eval.reconciliation_ledger` (e no campo `conservation_check` de `eval_snapshots`). Se qualquer lei falhar, a reconciliação marca `conservation_passed = FALSE` e levanta erro explícito:
+| # | Fonte Física Bruta | Localização Exata | Extração v2.1 (Sem Perda Semântica) | Destino em `vcxa-scion-aa.scion_eval` (`US`) |
+|---|---|---|---|---|
+| **1** | **Cloud Logging `_AllLogs`** | `vcxa-scion-aa.scion_logs_linked._AllLogs` (`US`) | Eventos por turno em `scion-analytics` e `scion-agents` / `scion_hub` preservando `event_ts`, `session_id`, `trace_id`, tokens, `reported_cost_micros` e `NO_TOOL_CALL`. | Reconciliação atômica *per-turn* em `US` (`timestamp BETWEEN @w_start AND @w_end`). |
+| **2** | **Cloud Trace `_AllSpans`** | `vcxa-scion-aa.scion_trace_linked._AllSpans` (`US`) | Spans individuais `gen_ai.api.response/<model>` (`span_id`, `start_time`, tokens `input`/`output`/`cache`, modelo, latência) e `agent.tool.result/<tool>` (erros consecutivos). | Reconciliação atômica *per-turn* em `US` (`start_time BETWEEN @w_start AND @w_end`). |
+| **3** | **Transcripts Brutos (`.jsonl.gz`)** | `gs://vcxa-scion-aa-eval-reports/transcripts/...` → `raw_task_trajectories` (`US`) | Steps individuais com **`step_ts` preservado por step** (nunca colapsados num único bloco de sessão!), `step_index`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `tool_names`, `tool_errors_count`. | Steps em `raw_task_trajectories` (`US`) + curva *per-turn* por checkpoint. |
+| **4** | **Walgit Commits & Diffs** | `https://<walgit-url>/scion-aa/<slug>` (Direct IAP `signJwt` + `X-Walgit-Authorization`) | De `/{owner}/{slug}/api/refs/branches`, `/api/commits` e `/api/commit/{sha}`: `commit_sha`, `parent_shas`, `branch`, `commit_subject`, `commit_body`, `author_agent`, `author_email`, `committed_at`, `files_changed`, `insertions`, `deletions`, `rewritten_files_count` e `changed_paths` (`stats[].path`). | Upsert ordenado em `scion_eval.walgit_commits_raw` (`US`). |
+| **5** | **Farm Table Tasks & Transições Completas** | 1) Firestore sombra `vcxa-farmtable` coleção `tasks` (`roles/datastore.viewer`) / API Direct IAP `farmtable-gcp`<br>2) `vcxa-farmtable.farmtable_analytics.{tasks_snapshot, stage_transitions_fact}` (`us-central1`) | **`title`**, **`description` completa**, **`acceptance_criteria`**, `task_type`, `phase`, `stage`, `priority`, `assignee_id` (resolvido via `users_dim`), `parent_task_id`, `branch`, `repo`, `ci_status`, `labels`, `remote_data_json` e transições regressivas. | Upsert completo em `scion_eval.{ft_tasks_raw, ft_stage_transitions_raw}` (`US`). |
+
+#### Algoritmo Determinístico de Correlação Commit ↔ Tarefa (4 Níveis)
+Para eliminar `task_id = NULL` em `walgit_commits_raw` quando agentes usam branches `feature/*` ou commitam direto em `main`:
+1. **Nível C1 (Referência Explícita):** Branch no formato `task/<task_id>(/clone-<k>)?` **ou** presença do `task_id` / prefixo `#<task_id[:8]>` / trailer `Task-Id:` em `commit_subject` + `commit_body`.
+2. **Nível C2 (Match de Feature Branch / Merge Commit):** `commit.branch != 'main'` igual a `ft_tasks_raw.branch` do mesmo `project_slug` (ou commit de merge em `main` cujo `commit_subject` referencia `integrate <ft_tasks_raw.branch>` / `Merge branch '<ft_tasks_raw.branch>'`).
+3. **Nível C3 (Identidade do Worker + Janela Ativa da Tarefa):** Match normalizado entre `commit.author_agent` (ex.: `pingcrm-worker-1`, `Scion Agent (worker-dev)`, `worker-3`) e `ft_tasks_raw.assignee_id` / `stage_transitions.actor_id` com `committed_at` contido em `[entered_working_at, COALESCE(closed_at, window_end) + 5m]` (ou `[created_at, closed_at + 5m]`).
+4. **Nível C4 (Tarefa Única de Implementação Ativa na Janela):** Se o commit em `main` ocorrer durante a janela `[created_at, closed_at + 5m]` de uma tarefa `task`/`bug` ativa no projeto, vincula-se à tarefa mais próxima pelo fechamento imediatamente subsequente ao commit (ex.: `379d7a38` às `04:03:11Z` → `#acc95814` fechada às `04:03:21Z`), propagando o rollup de commits para o `parent_task_id` (`epic`) correspondente.
+
+#### Síntese Determinística de `description_excerpt` (100% de Cobertura Humana)
+- Para toda tarefa com `description` não-vazia: remove cabeçalhos Markdown redundantes e cercas de código, produzindo um resumo limpo de até `220` caracteres (`description_excerpt`), preservando o Markdown integral em `description` e `acceptance_criteria`.
+- Para tarefas `task_type = 'epic'` cujo corpo `description` esteja vazio no Farm Table mas possuam subtarefas filhas (`parent_task_id == epic.task_id`, como o épico `#ea941b74` em `movr-flask`): sintetiza automaticamente `description_excerpt` listando a contagem e os títulos das subtarefas filhas concluídas (`"Épico guarda-chuva (6 subtarefas): Planejamento Serverless GCP; Camada Spanner/Firestore; API HTTP Go..."`).
+
+---
+
+### 3.3 Fatiamento Atômico por Turno e Partição Física Dual-Lens (`delta_finops` + `cumulative_finops`)
+
+Na v2.1, a unidade atômica de reconciliação $e$ **é o turno / chamada de modelo individual** (identificado por `(project_slug, agent_id, session_id, turn_key)` onde `turn_key` separa cada span `gen_ai.api.response`, evento `agent.usage` ou step `PLANNER_RESPONSE` de `raw_task_trajectories` com seu timestamp físico exato $t(e)$), **jamais** colapsando uma sessão inteira de 45 minutos em um único registro:
+
+1. **Custo Físico Inteiro em Microdólares ($m(e) \in \mathbb{Z}_{\ge 0}$):**
+   Cada unidade atômica $e$ reconcilia seus tokens sem duplicação (`Law 1`) e recebe `cost_micros(e) = round(cost_usd(e) * 1_000_000)`, classificado nos 3 buckets físicos:
+   - `hb_micros(e) = cost_micros(e)` se $e$ for acordada ociosa de Nível 4 (`NO_TOOL_CALL` sem tarefa ativa e sem tool calls);
+   - `rework_micros(e) = cost_micros(e)` se $e$ estiver vinculada a uma tarefa `task_id` após regressão de estágio (`in_review → working`), em loop de erro de ferramenta (`tool_errors >= 2` / falha consecutiva) ou churn pós-falha de CI;
+   - `prod_micros(e) = cost_micros(e)` nos demais turnos produtivos vinculados à tarefa.
+2. **Alocação por Checkpoint $k \in \{1, \dots, K\}$ nos Intervalos Disjuntos $I_k$:**
+   Dados os checkpoints ordenados $C_1, \dots, C_K$ do projeto com fronteiras $T_1 < T_2 < \dots < T_K$:
+   - Define-se $I_1 = (-\infty, T_1]$, $I_k = (T_{k-1}, T_k]$ para $2 \le k < K$, e $I_K = (T_{K-1}, +\infty)$ (dentro da janela reconciliada $[W_{\text{start}}, W_{\text{end}}]$, absorvendo eventuais acordadas ociosas posteriores a $T_K$).
+   - Todo evento atômico $e$ pertence a **exatamente um** intervalo $I_k$ ($t(e) \in I_k$).
+   - Para cada checkpoint $k$ e cada bucket $b \in \{\text{prod}, \text{rework}, \text{hb}\}$:
+     $$\Delta M_b(k) = \sum_{e:\, t(e) \in I_k} m_b(e), \qquad \Delta M_{\text{total}}(k) = \Delta M_{\text{prod}}(k) + \Delta M_{\text{rework}}(k) + \Delta M_{\text{hb}}(k)$$
+     $$CM_b(k) = \sum_{j=1}^{k} \Delta M_b(j), \qquad CM_{\text{total}}(k) = CM_{\text{prod}}(k) + CM_{\text{rework}}(k) + CM_{\text{hb}}(k)$$
+   - Os valores exportados em `delta_finops` e `cumulative_finops` são convertidos exatamente de microdólares inteiros (`round(micros / 1_000_000, 6)`), preservando aritmética exata de centavos/microdólares.
+   - As acordadas ociosas de Nível 4 ocorridas em $I_k$ também são distribuídas via `divmod` inteiro sobre as tarefas ativas/concluídas para `task_eval_facts` (mantendo `Law 2` por tarefa), enquanto permanecem visíveis em `delta_finops.heartbeat_tax_usd`.
+
+---
+
+### 3.4 As 4 Leis de Conservação Obrigatórias na v2.1
+
+Todo ciclo de reconciliação valida as **4 Leis de Conservação** e grava o resultado em `scion_eval.reconciliation_ledger` e `eval_snapshots.conservation_check`. Se qualquer lei falhar, `conservation_passed = FALSE` e o reconciliador levanta exceção explícita:
 
 1. **Lei 1 — Conservação e Deduplicação de Tokens Brutos:**
-   Para cada `(project_id, session_id)` na janela $[T_0, T_1]$:
-   $$\text{Tokens}_{\text{reconciliados}}(s) = \max\Big(\sum \text{Tokens}_{\text{\_AllSpans}}(s),\; \sum \text{Tokens}_{\text{\_AllLogs}}(s),\; \sum \text{Tokens}_{\text{transcript}}(s)\Big)$$
-   Nenhum turno é contado em duplicidade entre `_AllSpans` e `raw_task_trajectories`, e nenhum span `gen_ai.api.response` registrado no Cloud Trace pode resultar em `0` tokens reconciliados.
-2. **Lei 2 — Conservação FinOps Exata (`conservation_drift_usd == 0.0`):**
-   - **Por tarefa:** `ROUND(total_cost_usd - (productive_cost_usd + rework_cost_usd + heartbeat_tax_usd), 6) == 0.000000`.
-   - **Por projeto na janela $[T_0, T_1]$:** a soma de `total_cost_usd` de todas as linhas de `task_eval_facts` + `unassigned_project_heartbeat_tax_usd` iguala exatamente (diferença `<= $0.000001`) o custo total calculado diretamente sobre todos os eventos brutos `gen_ai` do projeto em `_AllSpans` / `_AllLogs` na mesma janela.
-3. **Lei 3 — Conservação de Cardinalidade de Tarefas (Tracker ↔ Warehouse):**
-   Toda tarefa com `phase = 'CLOSED'` (ou `stage = 'completed'`) em `ft_tasks_raw` pertencente a um projeto monitorado na janela $[T_0, T_1]$ **DEVE** produzir exatamente 1 linha correspondente em `scion_eval.task_eval_facts` (`COUNT(DISTINCT closed_ft_tasks) == COUNT(DISTINCT materialized_task_facts)`). É fisicamente impossível o reconciliador reportar `rows_inspected = 0` quando existem tarefas concluídas em `ft_tasks_raw`.
-
-```mermaid
-sequenceDiagram
-    participant FT as Farm Table (vcxa-farmtable)
-    participant PS as Pub/Sub Cross-Project Push
-    participant CR as Cloud Run eval-fabrica (--iap)
-    participant BQ as BigQuery (vcxa-scion-aa US)
-    participant FS as Firestore (default)
-    participant AG as eval-<project-slug> (scion-eval-central)
-
-    FT->>PS: Publica CloseTask / StageTransition em vcxa-farmtable/farmtable-task-events
-    PS->>CR: POST /api/v2/events/farmtable (autenticado)
-    CR->>FT: Pull incremental tasks_snapshot + stage_transitions_fact (us-central1)
-    CR->>BQ: Upsert ft_tasks_raw + ft_stage_transitions_raw + walgit_commits_raw (US)
-    CR->>BQ: Reconcilia _AllLogs + _AllSpans + raw_task_trajectories (janela estrita, location=US)
-    BQ->>BQ: Valida 3 Leis de Conservação (drift == 0.0) + ML.GENERATE_TEXT -> task_eval_facts
-    CR->>FS: Upsert eval_snapshots & estado vivo -> dispara on_snapshot SSE p/ browsers
-    CR->>AG: Dispara ciclo de avaliação escopado ao project_slug
-```
+   Para cada turno/sessão reconciliada, $\text{Tokens}_{\text{reconciliados}} = \max(\text{Tokens}_{\text{\_AllSpans}}, \text{Tokens}_{\text{\_AllLogs}}, \text{Tokens}_{\text{transcript}})$, sem dupla contagem entre fontes e nunca resultando em `0` tokens quando houver span `gen_ai.api.response`.
+2. **Lei 2 — Conservação FinOps Exata por Tarefa e Projeto (`conservation_drift_usd == 0.0`):**
+   - Por tarefa: `ROUND(total_cost_usd - (productive_cost_usd + rework_cost_usd + heartbeat_tax_usd), 6) == 0.000000`.
+   - Por projeto: `ABS(raw_genai_cost_usd - reconciled_total_cost_usd) <= 0.000001`.
+3. **Lei 3 — Conservação de Cardinalidade 1:1 de Tarefas Concluídas:**
+   Toda tarefa de build com `phase = 'CLOSED'` ou `stage = 'completed'` em `ft_tasks_raw` produz exatamente `1` linha em `scion_eval.task_eval_facts` (`ft_closed_tasks_count == materialized_tasks_count`, nunca `rows_inspected = 0` quando há tarefas fechadas).
+4. **Lei 4 *(Nova na v2.1)* — Conservação Temporal Aditiva entre Checkpoints (`checkpoint_drift_usd == 0.0`):**
+   Para todo projeto com $K \ge 1$ checkpoints ordenados $k = 1 \dots K$:
+   - **Intra-Checkpoint ($\forall k$):** `ROUND(delta_finops[k].total_cost_usd - (delta_finops[k].productive_cost_usd + delta_finops[k].rework_cost_usd + delta_finops[k].heartbeat_tax_usd), 6) == 0.000000` (e analogamente para `cumulative_finops[k]`).
+   - **Aditividade Passo-a-Passo ($\forall k$):** $\sum_{j=1}^{k} \text{delta\_finops}[j].b \equiv \text{cumulative\_finops}[k].b$ (`<= $0.000001`) para todo bucket $b \in \{\text{total}, \text{productive}, \text{rework}, \text{heartbeat}\}$.
+   - **Fechamento Global do Projeto ($k = K$):**
+     $$\sum_{k=1}^{K} \text{delta\_finops}[k].\text{total\_cost\_usd} \equiv \text{cumulative\_finops}[K].\text{total\_cost\_usd} \equiv \text{reconciliation\_ledger.reconciled\_total\_cost\_usd}$$
+     com `checkpoint_conservation_drift_usd == 0.000000`.
 
 ---
 
-### 3.4 Tabelas Adicionais de Matéria-Prima em `vcxa-scion-aa.scion_eval` (`location = 'US'`)
+### 3.5 Schema BigQuery v2.1 em `vcxa-scion-aa.scion_eval` (`location = 'US'`)
 
-Além das tabelas `task_agent_sessions`, `raw_task_trajectories`, `task_llm_extractions`, `task_eval_facts` e `model_pricing_dim` (todas provisionadas com `location = 'US'` em `vcxa-scion-aa`), o DDL v2 (`01_linked_datasets_and_tables.sql`) adiciona as tabelas espelho de matéria-prima para permitir JOIN 100% em `US`:
+O DDL canônico (`custom/eval-fabrica/sql/01_linked_datasets_and_tables.sql`, aplicado idempotentemente com `CREATE TABLE IF NOT EXISTS` + `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` para tabelas já criadas na v2.0) estende as tabelas espelho e fatos analíticos com semântica humana completa e métricas `delta`/`cumulative`:
 
 ```sql
-CREATE TABLE IF NOT EXISTS `${PROJECT_ID}.scion_eval.ft_tasks_raw` (
+CREATE TABLE IF NOT EXISTS `${PROJECT_ID}.${EVAL_DATASET}.ft_tasks_raw` (
   task_id STRING NOT NULL,
   collection_id STRING NOT NULL,
   project_slug STRING NOT NULL,
   parent_task_id STRING,
   title STRING,
-  task_type STRING,
+  description STRING,                    -- v2.1: Markdown completo da tarefa no Farm Table
+  description_excerpt STRING,            -- v2.1: Resumo limpo <= 220 chars (100% preenchido, incl. épicos)
+  acceptance_criteria STRING,            -- v2.1: Critérios de aceite do Farm Table
+  task_type STRING,                      -- epic | task | bug | decision
   phase STRING,
   stage STRING,
   priority STRING,
-  assignee_id STRING,
+  assignee_id STRING,                    -- Display name resolvido (ex: worker-dev, pingcrm-worker-1)
+  repo STRING,
   branch STRING,
   ci_status STRING,
   labels ARRAY<STRING>,
@@ -269,186 +317,182 @@ CREATE TABLE IF NOT EXISTS `${PROJECT_ID}.scion_eval.ft_tasks_raw` (
 PARTITION BY DATE(updated_at)
 CLUSTER BY project_slug, task_id;
 
-CREATE TABLE IF NOT EXISTS `${PROJECT_ID}.scion_eval.ft_stage_transitions_raw` (
-  transition_id STRING NOT NULL,
-  task_id STRING NOT NULL,
-  project_slug STRING NOT NULL,
-  from_stage STRING,
-  to_stage STRING,
-  actor_id STRING,
-  is_regression BOOL NOT NULL,           -- TRUE quando in_review/in_qa -> working ou reopened
-  transitioned_at TIMESTAMP NOT NULL,
-  synced_at TIMESTAMP NOT NULL
-)
-PARTITION BY DATE(transitioned_at)
-CLUSTER BY project_slug, task_id;
-
-CREATE TABLE IF NOT EXISTS `${PROJECT_ID}.scion_eval.walgit_commits_raw` (
+CREATE TABLE IF NOT EXISTS `${PROJECT_ID}.${EVAL_DATASET}.walgit_commits_raw` (
   commit_sha STRING NOT NULL,
   project_slug STRING NOT NULL,
   branch STRING NOT NULL,
-  task_id STRING,
+  parent_shas ARRAY<STRING>,             -- v2.1: SHAs pais (rastreia merges e base upstream)
+  commit_subject STRING,                 -- v2.1: Mensagem curta humana do commit
+  commit_body STRING,                    -- v2.1: Corpo da mensagem de commit
+  task_id STRING,                        -- v2.1: Correlacionado via matcher determinístico C1..C4
   clone_group_id STRING,
   clone_id STRING,
   author_agent STRING,
+  author_email STRING,
   files_changed INT64,
   insertions INT64,
   deletions INT64,
-  rewritten_files_count INT64,           -- arquivos re-editados na mesma task (sinal físico de churn)
+  rewritten_files_count INT64,
+  changed_paths ARRAY<STRING>,           -- v2.1: Lista de arquivos alterados no commit (até 100)
+  commit_url STRING,                     -- v2.1: Deep-link https://<walgit>/scion-aa/<slug>/commit/<sha>
   committed_at TIMESTAMP NOT NULL,
   synced_at TIMESTAMP NOT NULL
 )
 PARTITION BY DATE(committed_at)
 CLUSTER BY project_slug, task_id;
 
-CREATE TABLE IF NOT EXISTS `${PROJECT_ID}.scion_eval.reconciliation_ledger` (
-  reconciliation_id STRING NOT NULL,
-  project_slug STRING NOT NULL,
-  window_start TIMESTAMP NOT NULL,
-  window_end TIMESTAMP NOT NULL,
-  raw_logs_count INT64 NOT NULL,
-  raw_spans_count INT64 NOT NULL,
-  raw_transcript_steps INT64 NOT NULL,
-  ft_closed_tasks_count INT64 NOT NULL,
-  materialized_tasks_count INT64 NOT NULL,
-  raw_genai_cost_usd FLOAT64 NOT NULL,
-  reconciled_total_cost_usd FLOAT64 NOT NULL,
+CREATE TABLE IF NOT EXISTS `${PROJECT_ID}.${EVAL_DATASET}.task_eval_facts` (
+  fact_id STRING NOT NULL,               -- <project_id>:<task_id>:<clone_id_or_primary>
+  project_id STRING NOT NULL,
+  task_id STRING NOT NULL,
+  short_id STRING,                       -- v2.1: #<task_id[:8]> (ex: #2b52b74e)
+  parent_task_id STRING,
+  title STRING,                          -- v2.1: Título humano da tarefa (nunca UUID cru)
+  description_excerpt STRING,            -- v2.1: Resumo humano conciso
+  task_type STRING,                      -- v2.1: epic | task | bug | decision
+  priority STRING,
+  assignee STRING,
+  branch STRING,
+  checkpoint_id STRING,                  -- v2.1: snapshot_id do checkpoint em que a tarefa foi entregue
+  commit_shas ARRAY<STRING>,             -- v2.1: Commits Walgit correlacionados à tarefa
+  commits_count INT64,
+  files_changed INT64,
+  insertions INT64,
+  deletions INT64,
+  clone_group_id STRING,
+  clone_id STRING,
+  template_name STRING,
+  template_hash STRING,
+  model STRING,
+  thinking_level STRING,
+  harness STRING,
+  agent_role STRING,
+  stack STRING,
+  task_category STRING,
+  complexity_tier STRING,
+  total_cost_usd FLOAT64 NOT NULL,
+  productive_cost_usd FLOAT64 NOT NULL,
+  rework_cost_usd FLOAT64 NOT NULL,
+  heartbeat_tax_usd FLOAT64 NOT NULL,
   conservation_drift_usd FLOAT64 NOT NULL,
-  conservation_passed BOOL NOT NULL,
-  reconciled_at TIMESTAMP NOT NULL
+  eval_experiment_cost_usd FLOAT64,
+  input_tokens INT64,
+  output_tokens INT64,
+  cache_read_tokens INT64,
+  cache_bloat_slope FLOAT64,
+  lead_time_minutes FLOAT64,
+  rework_cycles INT64,
+  tool_calls_count INT64,
+  tool_errors_count INT64,
+  stage_thrash_count INT64,
+  final_stage STRING,
+  ci_passed BOOL,
+  rework_root_cause STRING,
+  semantic_thrashing_detected BOOL,
+  anti_patterns ARRAY<STRING>,
+  agents_md_adherence_score FLOAT64,
+  handoff_quality_score FLOAT64,
+  analysis_id STRING,
+  eval_run_id STRING,
+  task_closed_at TIMESTAMP,
+  materialized_at TIMESTAMP NOT NULL
 )
-PARTITION BY DATE(reconciled_at)
-CLUSTER BY project_slug;
+PARTITION BY DATE(materialized_at)
+CLUSTER BY project_id, task_id, clone_group_id;
+
+CREATE TABLE IF NOT EXISTS `${PROJECT_ID}.${EVAL_DATASET}.eval_snapshot_facts` (
+  snapshot_id STRING NOT NULL,           -- genesis | <git_sha8> | post-<head_sha8>
+  project_slug STRING NOT NULL,
+  checkpoint_index INT64,                -- 1..K ordem cronológica no projeto
+  checkpoint_kind STRING,                -- genesis | commit | post_commit
+  git_sha STRING,
+  git_branch STRING,
+  commit_subject STRING,
+  committed_at TIMESTAMP,
+  files_changed INT64,
+  insertions INT64,
+  deletions INT64,
+  delta_total_cost_usd FLOAT64,          -- v2.1: Gasto incremental estrito em (T_{k-1}, T_k]
+  delta_productive_cost_usd FLOAT64,
+  delta_rework_cost_usd FLOAT64,
+  delta_heartbeat_tax_usd FLOAT64,
+  delta_turns_count INT64,
+  delta_tasks_completed_count INT64,
+  total_cost_usd FLOAT64,                -- Acumulado até T_k (cumulative_finops.total_cost_usd)
+  productive_cost_usd FLOAT64,
+  rework_cost_usd FLOAT64,
+  heartbeat_tax_usd FLOAT64,
+  conservation_drift_usd FLOAT64,
+  compliance_score_pct FLOAT64,
+  mutation_score_pct FLOAT64,
+  system_verdict STRING,
+  published_at TIMESTAMP NOT NULL
+)
+PARTITION BY DATE(published_at)
+CLUSTER BY project_slug, snapshot_id;
 ```
 
-**Guardrails Inegociáveis de Query no BigQuery:**
-1. `EVAL_BQ_LOCATION=US` padrão para todos os datasets em `vcxa-scion-aa` (`FARMTABLE_BQ_LOCATION=us-central1` isolado exclusivamente no conector de leitura de `vcxa-farmtable.farmtable_analytics`).
-2. `validate_time_windowed_sql(sql)` bloqueia em tempo de execução qualquer `SELECT` sobre `_AllLogs`, `_AllSpans`, `ft_*_raw`, `raw_task_trajectories`, `task_llm_extractions` ou `task_eval_facts` que não contenha predicado explícito de partição/janela temporal.
+**Guardrails Inegociáveis de Query no BigQuery (Mantidos 100%):**
+1. `EVAL_BQ_LOCATION=US` padrão para todos os datasets em `vcxa-scion-aa` (`FARMTABLE_BQ_LOCATION=us-central1` isolado no conector de leitura de `vcxa-farmtable.farmtable_analytics`).
+2. `validate_time_windowed_sql(sql)` bloqueia em tempo de execução qualquer `SELECT` sobre tabelas particionadas/linkadas sem filtro temporal explícito.
 3. `maximumBytesBilled` positivo obrigatório (`default = 2 GiB`) em 100% dos jobs BigQuery.
 
 ---
 
-## 4. Modelo Operacional e de UI no Firestore `(default)` Native (`eval_*`)
+## 4. Contrato Operacional e de UI no Firestore `(default)` Native (`eval_*` v2.1)
 
-Na v2, **nenhum arquivo JSON de índice ou snapshot de UI é lido do GCS**. Todas as visões da aplicação Cloud Run Direct IAP (e todos os eventos SSE) leem e observam **5 coleções `eval_*`** no Firestore `(default)` Native (estendendo [`scripts/factory_store.py`](file:///usr/local/google/home/vixavier/sources/scion-workspace/scion-repos/scion-defaults/scripts/factory_store.py)):
+Todas as visões e eventos SSE operam sobre as **5 coleções `eval_*`** no Firestore `(default)` Native ([`scripts/factory_store.py`](file:///usr/local/google/home/vixavier/sources/scion-workspace/scion-repos/scion-defaults/scripts/factory_store.py)):
 
-| Coleção Firestore | ID do Documento | Papel na Arquitetura v2 | Campos-Chave Obrigatórios |
+| Coleção Firestore | ID Determinístico do Documento | Papel na Arquitetura v2.1 | Campos Obrigatórios e Extensões v2.1 |
 |---|---|---|---|
-| **`eval_agent_state`** | `<project_slug>` (ex: `movr-flask`, `pingcrm`, `pitstop`, `micronaut-microservices-poc`) + `fleet-global` | Estado vivo, configuração de governança, cursores e último veredito saudável/anômalo de cada agente `eval-<project-slug>` em `scion-eval-central`. | `project_slug`, `hub_project_id` (`"scion-eval-central"`), `hub_agent_name` (`"eval-<project_slug>"`), `governance_mode` (`"human_approval"` default), `require_strong_hypothesis` (`true`), `enabled`, `policy` (`{daily_experiment_budget_usd, monthly_experiment_budget_usd, min_sample_size, max_clone_variants, rollback_window_tasks, rollback_regression_threshold_pct, cooldown_hours}`), `last_evaluation` (`{at, status: "no_actionable_anomaly" \| "hypothesis_opened", rows_inspected, reconciliation_id}`), `cursors`, `spend`, `cooldown_until`, `updated_at`. |
-| **`eval_analyses`** | `<analysis_id>` | **Objeto científico de 1ª classe ("Análise")**, criado **apenas** quando o gate de hipótese forte é superado (ou por demanda explícita humana). | `analysis_id`, `level` (`1` \| `2`), `project_slug`, `eval_agent_name` (`"eval-<project_slug>"`), `status` (`drafting` \| `testing` \| `awaiting_approval` \| `applying` \| `monitoring` \| `completed` \| `rolled_back` \| `rejected`), `task_ids`, `bq_evidence` (`{query_sql_hash, reconciliation_id, summary_metrics, strong_signals_triggered: []}`), `hypothesis` (`{statement, target_dimension, target_role, proposed_change, expected_delta}`), `experiment` (`{type, clone_group_ids, override_id}`), `results` (`{control_metrics, treatment_metrics, delta_pct, statistical_verdict, winner_variant, net_roi_usd}`), `governance` (`{mode: "human_approval", approval_task_id, approval_status, approved_by, decided_at}`), `lead_communications` (`[{sent_at, target: "<slug>/lead", summary}]`), `action_log`, `created_at`, `updated_at`. |
-| **`eval_clone_groups`** | `<clone_group_id>` | Rastreia execuções paralelas de `Clones de Tarefas` no Walgit + Scion Hub + Farm Table. | `clone_group_id`, `project_slug`, `source_task_id`, `base_commit_sha`, `triggered_by` (`leader` \| `eval_agent` \| `human`), `analysis_id`, `isolation_mode` (`worker_branch` \| `ephemeral_project`), `decision_task_id`, `variants` (`[{clone_id, ft_task_id, branch, agent_id, model, thinking_level_int, template, status, cost_usd, duration_s, ci_passed, transcript_proxy_path}]`), `winner_clone_id`, `merged_commit_sha`, `created_at`, `closed_at`. |
-| **`eval_factory_overrides`** | `<override_id>` | Snapshot auditável e reversível de mutações aplicadas via Scion Hub Runtime API pós-aprovação humana. | `override_id`, `analysis_id`, `project_slug`, `hub_project_id`, `target_scope` (`project_settings` \| `template` \| `agent_patch` \| `schedule`), `api_endpoint`, `target_id`, `mechanism`, `previous_state`, `applied_state`, `status` (`active` \| `promoted_to_git` \| `rolled_back` \| `expired`), `rollback_after_tasks`, `tasks_observed_since_apply`, `applied_at`, `resolved_at`. |
-| **`eval_snapshots`** *(Nova na v2)* | `<project_slug>__<snapshot_id>` | **Substitui `registry.json`, `manifest.json` e `snapshots/<id>/*.json` no GCS**: armazena os snapshots imutáveis de Time Travel diretamente no Firestore para renderização instantânea e push SSE. | `snapshot_id`, `project_slug`, `git_sha`, `git_branch`, `trigger`, `reconciliation_id`, `finops` (`{total_cost_usd, productive_cost_usd, rework_cost_usd, heartbeat_tax_usd, conservation_drift_usd}`), `trajectories_summary` (por task/step sem blobs gigantes), `agents_summary` (`context_curve`, `cache_bloat_slope`, `thrashing_incidents`, `anti_gaming_audit`, `protocol_compliance`), `system_summary` (`verdict`, `checks`), `transcript_refs` (`[{task_id, agent_id, incarnation_id, proxy_url: "/api/v2/transcripts/..."}]`), `published_at`. |
+| **`eval_snapshots`** | **`<project_slug>__<snapshot_id>`** onde `snapshot_id` $\in$ `{genesis, <git_sha8>, post-<head_sha8>}` *(proibido `snap-<wallclock>`)* | **Marco Imutável de Entrega do Produto (Time-Travel Idempotente)**: 1 doc por commit real no Walgit (+ `genesis` pré-commit e `post-<sha8>` pós-commit quando houver trabalho real nessas janelas). | - **Identidade & Ordem:** `snapshot_id`, `project_slug`, `checkpoint_index` (`1..K`), `checkpoint_kind` (`"genesis"` \| `"commit"` \| `"post_commit"`), `checkpoint_ts` ($T_k$ ISO-8601), `window_start_ts` ($T_{k-1}$), `window_end_ts` ($T_k$), `reconciliation_id`, `published_at`, `last_verified_at`.<br>- **`commit_provenance`:** `{repo_label: "walgit/scion-aa/<slug>", repo_url, commit_url, git_sha, git_sha8, base_upstream_sha, git_branch, commit_subject, commit_body, commit_author, committed_at, evaluated_at, files_changed, insertions, deletions, rewritten_files_count, changed_paths: [], tasks_delivered_count, tasks_delivered_ids: []}`.<br>- **`delta_finops` *(Lente Primária)*:** `{total_cost_usd, productive_cost_usd, rework_cost_usd, heartbeat_tax_usd, unassigned_heartbeat_tax_usd, conservation_drift_usd, input_tokens, output_tokens, cache_read_tokens, turns_count, tasks_completed_count}`.<br>- **`cumulative_finops` *(Lente Secundária)*:** `{total_cost_usd, productive_cost_usd, rework_cost_usd, heartbeat_tax_usd, unassigned_heartbeat_tax_usd, conservation_drift_usd, pct_of_project_total, input_tokens, output_tokens, cache_read_tokens, turns_count, tasks_completed_count}` (+ `finops` espelhando `cumulative_finops` p/ retrocompatibilidade).<br>- **`tasks_breakdown`:** lista rica de tarefas com `{task_id, short_id: "#2b52b74e", title, description, description_excerpt, acceptance_criteria, task_type, stage, priority, labels, assignee, parent_task_id, parent_title, delivered_in_checkpoint: bool, checkpoint_id, total_cost_usd, productive_cost_usd, rework_cost_usd, heartbeat_tax_usd, input_tokens, output_tokens, cache_read_tokens, tool_calls_count, tool_errors_count, lead_time_minutes, ci_passed, rework_root_cause, commits: [{sha, sha8, subject, branch, committed_at, files_changed, insertions, deletions, commit_url}], farmtable_url, walgit_branch_url, transcript_proxy_url}` *(com `transcript_proxy_url` preenchido **somente** em match exato de `task_id`!)*.<br>- **`agents_summary`:** `{context_curve: [{turn: 1..M, step_ts, agent_id, task_short_id, input_tokens, cache_read_tokens, output_tokens}], cache_bloat_slope, thrashing_incidents, protocol_compliance, no_tool_call_wakeups, session_transcript_refs}`.<br>- **`conservation_check`:** `{passed, law1_token_dedup_passed, law2_finops_zero_drift_passed, law3_task_cardinality_passed, law4_checkpoint_sum_passed, checkpoint_conservation_drift_usd}`.<br>- **`system_summary`** & **`transcript_refs`**. |
+| **`eval_agent_state`** | `<project_slug>` + `fleet-global` | Estado vivo, política de orçamento, cursores e último veredito do agente `eval-<project-slug>`. | `project_slug`, `hub_project_id` (`"scion-eval-central"`), `hub_agent_name`, `governance_mode` (`"human_approval"`), `require_strong_hypothesis` (`true`), `enabled`, `policy`, `last_evaluation` (`{at, status: "no_actionable_anomaly" \| "hypothesis_opened", rows_inspected, checkpoints_count, reconciliation_id}`), `cursors`, `spend`, `cooldown_until`, `updated_at`. |
+| **`eval_analyses`** | `<analysis_id>` | Objeto científico de 1ª classe aberto **apenas** quando os limiares `S1–S5` disparam. | Todos os campos v2.0 (`level`, `project_slug`, `eval_agent_name`, `status`, `bq_evidence`, `hypothesis`, `experiment`, `results`, `governance`, `lead_communications`, `action_log`) + **`tasks_context`** (`[{task_id, short_id, title, description_excerpt, stage, task_type, total_cost_usd, rework_cost_usd, commit_shas}]`) para exibição 100% legível por humanos sem UUIDs crus. |
+| **`eval_clone_groups`** | `<clone_group_id>` | Rastreia variantes paralelas A/B (`Clones de Tarefas`) sobre o mesmo `base_commit_sha` no Walgit. | `clone_group_id`, `project_slug`, `source_task_id`, **`source_task_short_id`**, **`source_task_title`**, **`source_task_excerpt`**, `base_commit_sha`, `base_commit_url`, `triggered_by`, `analysis_id`, `isolation_mode`, `decision_task_id`, `variants` (`[{clone_id, ft_task_id, short_id, branch, walgit_branch_url, commit_sha, commit_url, agent_id, model, thinking_level_int, template, status, cost_usd, productive_cost_usd, rework_cost_usd, duration_s, ci_passed, transcript_proxy_path}]`), `winner_clone_id`, `merged_commit_sha`, `created_at`, `closed_at`. |
+| **`eval_factory_overrides`** | `<override_id>` | Snapshot auditável e reversível de mutações Runtime API (`T0–TX`) com auto-rollback. | `override_id`, `analysis_id`, `project_slug`, `hub_project_id`, `target_scope`, `api_endpoint`, `target_id`, `mechanism`, `previous_state`, `applied_state`, `status`, `rollback_after_tasks`, `tasks_observed_since_apply`, `applied_at`, `resolved_at`. |
 
 ---
 
-## 5. Topologia em `scion-eval-central`: 1 Agente Dedicado por Projeto & Hipótese Forte
+## 5. Topologia `scion-eval-central`, Hipótese Forte (`S1–S5`) e Execução Governada
 
-### 5.1 Um Agente Dedicado `eval-<project-slug>` por Projeto + `eval-fleet-global`
+Todas as garantias de governança multi-agente introduzidas na v2.0 permanecem estritamente ativas na v2.1:
 
-O projeto administrativo central **`scion-eval-central`** no Hub (`tfhaa-main`) hospeda a frota de auditores isolados por projeto, aposentando definitivamente o agente único genérico `eval-auditor`:
-
-| Agente em `scion-eval-central` | Escopo de Dados & Permissão | Responsabilidade |
-|---|---|---|
-| **`eval-<project-slug>`** *(1 por projeto ativo; em `vcxa-scion-aa`: `eval-movr-flask`, `eval-pingcrm`, `eval-pitstop`, `eval-micronaut-microservices-poc`)* | `EVAL_LEVEL=1`, `EVAL_TARGET_PROJECT=<project-slug>`. Queries BQ e leituras Firestore estritamente filtradas por `project_id = '<project-slug>'`. | Audita a matéria-prima reconciliada daquele único projeto, verifica as leis de conservação, avalia o Gate de Hipótese Forte, dialoga via chat com `<project-slug>/lead` e abre gates `type:decision` na coleção `<project-slug>` do Farm Table quando necessário. |
-| **`eval-fleet-global`** *(1 por ambiente Scion)* | `EVAL_LEVEL=2`. Lê **apenas** métricas agregadas cross-project (`template_name`, `template_hash`, `model`, `thinking_level`, `harness`, `stack`, `complexity_tier`) em `scion_eval.task_eval_facts` — **zero** acesso a código, prompts de produto ou transcripts brutos individuais. | Identifica regressões sistêmicas de templates base ou modelos em múltiplos projetos (`distinct_projects >= 2`) e propõe melhorias transversais em `scion-defaults` sob aprovação humana. |
-
-**Regras de Isolamento Estrutural:**
-1. **Zero Agente `eval-*` dentro dos Projetos de Build:** Nos projetos `movr-flask`, `pingcrm`, `pitstop` e `micronaut-microservices-poc` rodam apenas `lead` e builders/clones. Isso impede conflito de interesse (*anti-gaming*), auto-aprovação e poluição do workspace do produto.
-2. **Provisionamento Idempotente de Frota:** Sempre que um projeto `<slug>` é registrado na fábrica (`provision_factory.py` / `setup-eval-fabrica.sh`), o provisionador garante automaticamente o documento `eval_agent_state/<slug>` no Firestore e o agente `eval-<slug>` em `scion-eval-central` (e remove `eval-auditor` legado).
-
----
-
-### 5.2 Modo Semiautônomo (`human_approval`) e Protocolo de Comunicação Chat-Only com `lead`
-
-Todos os agentes em `scion-eval-central` operam por padrão em **`governance_mode = "human_approval"`** com fronteiras operacionais rígidas:
-
-1. **Comunicação Exclusiva via Chat (`scion message`) com `<project-slug>/lead`:**
-   - O agente `eval-<project-slug>` **nunca** edita código no repositório do projeto avaliado, **nunca** faz push na branch `main` do produto e **nunca** envia instruções diretas para agentes workers (`backend`, `frontend`, `worker-dev`).
-   - Quando uma anomalia forte requer contexto ou quando uma recomendação tática / hipótese aprovada precisa ser coordenada, `eval-<project-slug>` envia mensagem estruturada **apenas** ao líder do projeto (`POST /api/v1/projects/<project-slug>/agents/lead/message` / `scion message <project-slug>/lead "<resumo + analysis_id>"`) e registra o envio em `eval_analyses.lead_communications`.
-2. **Coordenação Formal via Farm Table (`ft`):**
-   - Para toda hipótese forte validada que proponha alteração em `Modelos`, `Templates`, `Settings` ou disparo de experimento controlado acima do teto canário, `eval-<project-slug>` cria uma issue de decisão na coleção `<project-slug>` do Farm Table:
-     - `Type = "decision"`, `Stage = "accepted"`, `Priority = "HIGH"`
-     - `Labels = ["status:po-decision", "hold:waiting_for_input", "eval-finding", "eval-analysis:<analysis_id>", "factory:<project-slug>"]`
-   - A `Ação` na fábrica (Runtime API com `eval_factory_overrides` ou Git Config PR em `scion-defaults`) **só é executada após aprovação humana explícita** (pelo botão `Approve` na UI Cloud Run Direct IAP ou fechamento/label `status:approved` na task `decision` pelo PO).
+1. **1 Agente Dedicado por Projeto em `scion-eval-central` (`O5`):**
+   - `eval-movr-flask`, `eval-pingcrm`, `eval-pitstop`, `eval-micronaut-microservices-poc` (`EVAL_LEVEL=1`, isolados em `project_id = '<slug>'`) + `eval-fleet-global` (`EVAL_LEVEL=2`, agregados anônimos com `distinct_projects >= 2`).
+   - Zero agente `eval-auditor` genérico legado e zero agentes `eval-*` dentro dos projetos de build.
+2. **Protocolo Semiautônomo (`human_approval`) & Chat-Only com `<slug>/lead`:**
+   - `eval-<slug>` **nunca** comita código no repositório do produto nem envia mensagens diretas a workers; comunica-se exclusivamente via `scion message <slug>/lead` e issues `type:decision` (`status:po-decision`, `hold:waiting_for_input`, `eval-finding`) na coleção `<slug>` do Farm Table, referenciando títulos humanos + `#<short_id>` e commits Walgit relevantes.
+3. **Gate Quantitativo Estrito de Hipótese Forte (`EVAL_REQUIRE_STRONG_HYPOTHESIS=1`, `O4`):**
+   - Projetos saudáveis encerram imediatamente em `status = "no_actionable_anomaly"` (`0` docs em `eval_analyses`, `0` issues no Farm Table, `0` mensagens ao `lead`).
+   - Abertura de hipótese exige `conservation_passed == TRUE` (Leis 1–4) **e** disparo comprovado de `S1` (`rework_pct >= 20%` c/ causa verificada ou `stage_thrash >= 2`), `S2` (`ci_pass_rate < 80%`), `S3` (`avg_cache_bloat_slope > 1200` tok/turn $\ge 35\%$ custo), `S4` (`heartbeat_tax_pct >= 25%` em $\ge 10$ acordadas ociosas) ou `S5` (`>= 5` erros repetidos na mesma ferramenta).
+4. **Clones Pareados e Mutações Reversíveis (`clone_orchestrator.py` & `T0–TX`):**
+   - `thinking_level` serializado obrigatoriamente como `int` (`25`/`50`/`100`), branches `task/<id>/clone-<k>` no Walgit sob Direct IAP e mutações pós-aprovação salvas em `eval_factory_overrides` com janela de auto-rollback (`10` tarefas / regressão `> 20%`).
 
 ---
 
-### 5.3 Gate Estrito de Hipótese Forte (`Strong-Hypothesis Gating` — Proibido Forçar Recomendações)
+## 6. Oráculos Independentes de Verificação (`Verification Oracles` O1–O8)
 
-Um defeito clássico de agentes avaliadores baseados em LLM é "inventar recomendações" em toda rodada para parecerem úteis, gerando fadiga de alertas e *parametric thrashing*. Na v2, **`EVAL_REQUIRE_STRONG_HYPOTHESIS=1` é obrigatório e inegociável**:
-
-1. **Comportamento Padrão em Projeto Saudável (`no_actionable_anomaly`):**
-   - Se as métricas reconciliadas do projeto estiverem saudáveis (ou a amostra for insuficiente), `eval-<project-slug>` conclui imediatamente com **`status = "no_actionable_anomaly"`**:
-     - Atualiza apenas `eval_agent_state.<project-slug>.last_evaluation` (com timestamp, `reconciliation_id` e `rows_inspected > 0`);
-     - **NÃO** cria documento em `eval_analyses`;
-     - **NÃO** abre issue no Farm Table;
-     - **NÃO** envia mensagem no chat do `<project-slug>/lead` (silêncio operacional em estado saudável!).
-2. **Limiar Quantitativo Objetivo para Abertura de Hipótese (`Level 1` — Projeto):**
-   Uma hipótese só pode ser formulada se `conservation_passed == TRUE` **E** pelo menos uma das seguintes condições severas for comprovada nos dados brutos reconciliados:
-   - **Sinal S1 (Retrabalho Alto com Causa Verificada):** `tasks_count >= 2` **E** `rework_pct >= 20.0%` **E** `rework_root_cause IN ('tool_error_loop', 'missing_context', 'ambiguous_spec', 'bad_handoff', 'harness_failure')` (ou `stage_thrash_count >= 2` em `ft_stage_transitions_raw`);
-   - **Sinal S2 (Degradação de Qualidade / CI):** `tasks_count >= 2` **E** `ci_pass_rate_pct < 80.0%`;
-   - **Sinal S3 (Explosão de Contexto / Cache Bloat):** `tasks_count >= 2` **E** `avg_cache_bloat_slope > 1200.0` tok/turn representando `>= 35%` do custo dos turnos;
-   - **Sinal S4 (Desperdício Severo de Heartbeat):** `heartbeat_tax_pct >= 25.0%` do gasto total do projeto em janela com `>= 10` acordadas `NO_TOOL_CALL`;
-   - **Sinal S5 (Loop Crítico de Ferramenta):** `total_tool_errors >= 5` repetidos na mesma ferramenta comprovados nos spans `agent.tool.result`.
-3. **Limiar Quantitativo Objetivo (`Level 2` — `eval-fleet-global`):**
-   Exige simultaneamente `distinct_projects >= 2`, `sample_size >= 5` tarefas reconciliadas e (`avg_rework_pct >= 20.0%` **ou** `ci_pass_rate_pct < 80.0%`).
-
-```mermaid
-flowchart TD
-    WAKE["Evento Farm Table / Ciclo Reconciliado"] --> RECON["Valida Reconciliação Bruta (conservation_passed == TRUE & rows_inspected > 0)"]
-    RECON --> GATE_H{"Atingiu Limiar Quantitativo S1..S5 (require_strong_hypothesis=True)?"}
-    GATE_H -->|"NÃO (Projeto Saudável)"| HEALTHY["Registra no_actionable_anomaly em eval_agent_state (Zero Análise, Zero FT Issue, Zero Chat)"]
-    GATE_H -->|"SIM (Anomalia Forte Comprovada)"| OPEN_AN["Cria eval_analyses (status=awaiting_approval / testing) no Firestore -> Push SSE"]
-    OPEN_AN --> NOTIFY["Envia diagnóstico conciso via scion message p/ <slug>/lead + Cria Gate FT type:decision (status:po-decision)"]
-    NOTIFY --> PO_WAIT{"Humano PO Aprova na UI IAP ou FT?"}
-    PO_WAIT -->|"Rejeitado"| REJ["Marca eval_analyses status=rejected"]
-    PO_WAIT -->|"Aprovado"| APPLY["Aplica Ação Auditada (Clones A/B, Runtime API c/ eval_factory_overrides ou Git PR em scion-defaults)"]
-    APPLY --> MON["Monitora próximas K tarefas -> Auto-Rollback se regressão > 20%"]
-```
-
----
-
-## 6. `Clones de Tarefas` e Execução Governada de `Ação` na `FÁBRICA`
-
-### 6.1 Isolamento e Contratos Reais de `Clones de Tarefas` (`clone_orchestrator.py`)
-Os **Clones de Tarefas** executam $N$ variantes (`2..5`) sobre exatamente o mesmo `base_commit_sha` no Walgit:
-- **Tracker (Zero Poluição no GitHub):** Subtarefas criadas exclusivamente no Farm Table (`--parent <source_task_id>`, `--branch task/<id>/clone-<k>`, labels `clone-group:<cg_id>`, `clone:c<k>`, `clone-role:control|treatment`, `factory:<slug>`) + 1 task `type:decision` bloqueada via `--blocked-by` por todos os clones.
-- **Scion Hub & Walgit:** Requer `workspaceMode: "per-agent"`. Na chamada `POST /api/v1/projects/{pid}/agents`, `ScionConfig.config.thinking_level` **DEVE** ser serializado como inteiro (`int`: `low=25`, `medium=50`, `high=100`, conforme `pkg/api/types.go:510`), nunca como string. Cada clone faz push exclusivamente para `task/<id>/clone-<k>` no Walgit via Direct IAP (`signJwt` + `X-Walgit-Authorization`).
-- **Comparação Pareada:** `compare_clones_in_bq()` compara `control` vs `treatment` agrupados por `clone_group_id` em `scion_eval.task_eval_facts` (`location=US`), exigindo `ci_passed == TRUE`, zero `anti_patterns` críticos e cálculo explícito de ROI líquido (`projected_monthly_savings_usd - eval_experiment_cost_usd`).
-
-### 6.2 Execução Dual de `Ação` Pós-Aprovação Humana
-Após aprovação humana registrada em `eval_analyses.governance`:
-1. **Via A — Scion Hub Runtime API (Canário Reversível):**
-   - Salva `previous_state` em `eval_factory_overrides` antes de qualquer mutação.
-   - Respeita estritamente os tiers `T0–TX` (`pkg/hub/agent_config_mutability.go`): usa `PATCH /api/v1/agents/{id}` para `T0/T1`, `reincarnate` para `T2/T3` compatíveis, e criação de agente substituto + stop limpo quando houver campos `TX` ou overrides não suportados por `reincarnate` (`harnessConfig`, `env`, `templateHash`, ou `worktree-per-agent`).
-   - Monitora `rollback_window_tasks` (default `10` tarefas); se houver regressão `> 20%`, restaura `previous_state` automaticamente (`status = "rolled_back"`).
-2. **Via B — Git Config PR em `scion-defaults`:**
-   - Cria branch `eval/analysis-<analysis_id>` alterando `presets/*.factory.yaml` ou `templates/<role>/*`, referenciando `analysis_id`, `reconciliation_id` e deltas pareados, seguido de `scion-factory compile` + `push-templates.py --apply`.
-
----
-
-## 7. Oráculos Independentes de Verificação (`Verification Oracles` O1–O6)
-
-Para garantir prova empírica sem viés de autor, a aceitação da Arquitetura v2 em `vcxa-scion-aa` é governada por **6 Oráculos Automatizados Independentes** (`custom/eval-fabrica/tests/oracles/verify_v2_oracles.py`), executados contra a infraestrutura viva e reportando veredito binário (`PASS` / `FAIL`):
+A aceitação da Arquitetura v2.1 em `vcxa-scion-aa` é governada por **8 Oráculos Automatizados Independentes** (`custom/eval-fabrica/tests/oracles/verify_v2_oracles.py`), executados ao vivo contra GCP (`vcxa-scion-aa` + `vcxa-farmtable` + `tfhaa-main` + Walgit + Cloud Run Direct IAP) com **zero mocks** e veredito binário (`PASS` / `FAIL`):
 
 | Oráculo | O que Prova | Procedimento Automatizado Independente (Sem Mocks) | Critério Binário de Aceite (`PASS`) |
 |---|---|---|---|
-| **O1: Fechamento Direct IAP & Fim do Firebase/CORS** | O serviço Cloud Run único está 100% fechado sob Direct IAP (`--iap`) com Two-Gate correto, e a superfície legada Firebase/CORS foi eliminada. | 1. `GET https://<eval-fabrica-url>/` e `/api/v2/bootstrap` sem headers → inspeciona status/Location.<br>2. `GET /api/v2/me` com OIDC `print-identity-token` comum → inspeciona rejeição.<br>3. `GET /api/v2/me` com `signJwt` de SA sem `iap.httpsResourceAccessor` → inspeciona `403`.<br>4. `GET /api/v2/me` e `/api/v2/bootstrap` com `signJwt` (`aud: "https://<url>/*"`) de SA autorizada e sessão browser de `admin@vixavier.altostrat.com`.<br>5. Inspeciona metadados de `gs://vcxa-scion-aa-eval-reports` (`gcloud storage buckets describe`). | 1. Sem credencial retorna `302` (Google Sign-In IAP) ou `401` (nunca `200`).<br>2. `print-identity-token` retorna `401`; SA não autorizada retorna `403`.<br>3. SA autorizada (`signJwt`) e humano autorizado retornam `200 OK` com identidade verificada pelo JWKS ES256.<br>4. Bucket GCS possui `public_access_prevention: enforced`, `cors: []` (vazio), zero `allUsers`/`allAuthenticatedUsers`, e a UI faz `0` requests para `*.web.app`, `storage.googleapis.com` ou `firebasestorage.googleapis.com`. |
-| **O2: Prova Estática e Dinâmica de Zero Polling (SSE)** | A UI não faz polling sob nenhuma hipótese e reflete mutações do Firestore em tempo real via SSE. | 1. Scan estático no código JS/HTML servido por `GET /`: busca `setInterval(` ou loops recursivos de `fetch`.<br>2. Abre a UI autenticada em Headless Chromium (Playwright/CDP), aguarda `GET /api/v2/bootstrap` concluir e grava 100% do tráfego de rede por `60s` ociosos.<br>3. Com a página aberta sem interação, o oráculo grava externamente um doc `eval_analyses/an-oracle-sse-<ts>` no Firestore `(default)` e mede o tempo até renderizar no DOM. | 1. `0` chamadas `setInterval` de rede no bundle JS.<br>2. Durante `60s` ociosos: exatamente `0` requests `fetch`/XHR adicionais e `1` stream `EventSource` ativo (`GET /api/v2/stream`, `200`, `text/event-stream`).<br>3. O card `an-oracle-sse-<ts>` aparece no DOM em `< 3.0s` via evento SSE, mantendo `0` requests de polling. |
-| **O3: Leis de Conservação sobre Matéria-Prima Bruta (`US`)** | Ingestão parte de `_AllLogs`, `_AllSpans`, transcripts, Walgit e Farm Table sem heurísticas sintéticas e respeita as 3 Leis de Conservação. | 1. Executa `raw_reconciler` contra `vcxa-scion-aa` (`US`) + `vcxa-farmtable` (`us-central1`).<br>2. Consulta diretamente `vcxa-scion-aa.scion_eval` (`location=US`) comparando `ft_tasks_raw`, `task_eval_facts`, `reconciliation_ledger`, `_AllLogs` e `_AllSpans`.<br>3. Inspeciona `sql/*.sql` e `raw_reconciler.py` contra constantes sintéticas (`0.65`) e executa query sem filtro de tempo em `BigQueryClient` para testar bloqueio. | 1. `ft_tasks_raw` contém todas as `>= 34` tasks concluídas de `vcxa-farmtable`, e `COUNT(DISTINCT task_id)` concluídas bate `1:1` com `task_eval_facts` (`rows_inspected > 0`).<br>2. `MAX(ABS(total_cost_usd - (productive_cost_usd + rework_cost_usd + heartbeat_tax_usd))) == 0.0` e `conservation_passed == TRUE` em `reconciliation_ledger`.<br>3. Zero constante `0.65` no SQL/código; query sem janela temporal levanta `ValueError` com `0` bytes faturados. |
-| **O4: Limiar Estrito de Hipótese Forte (`Strong-Hypothesis`)** | O agente nunca força recomendações em projetos saudáveis e exige evidência forte quantitativa antes de abrir análise/gate. | 1. **Teste Negativo (Saudável):** Executa `eval-<slug>` sobre dataset/projeto com métricas saudáveis (`rework_pct < 20%`, `ci_pass_rate >= 80%`, `tool_errors < 5`, `cache_bloat_slope <= 1200`).<br>2. **Teste Positivo (Anômalo):** Executa sobre tarefa/janela com anomalia física acima do limiar (ex.: `tool_error_loop` com `>= 5` erros em `agent.tool.result` e `rework_pct >= 25%`) em modo `human_approval`. | 1. Caso saudável retorna `status == "no_actionable_anomaly"`, gera `0` docs em `eval_analyses`, `0` tasks no Farm Table e `0` mensagens ao `lead`.<br>2. Caso anômalo gera `1` doc em `eval_analyses` (`status == "awaiting_approval"`), `1` gate `type:decision` (`status:po-decision`) no Farm Table e aplica `0` mutações diretas em settings/templates do Hub antes da aprovação. |
-| **O5: Isolamento `scion-eval-central` & Chat-Only** | Existe 1 agente `eval-<slug>` por projeto em `scion-eval-central`, zero `eval-auditor` legado, zero misturas nos projetos de build e comunicação restrita ao `lead` + `ft`. | 1. Consulta `GET /api/v1/projects` e `GET /api/v1/projects/{pid}/agents` em `tfhaa-main`.<br>2. Verifica `eval_agent_state` no Firestore.<br>3. Audita logs de despacho de mensagens e commits no Walgit dos projetos de build. | 1. `scion-eval-central` contém `eval-movr-flask`, `eval-pingcrm`, `eval-pitstop`, `eval-micronaut-microservices-poc` e `eval-fleet-global`; `eval-auditor` não existe.<br>2. Projetos de build contêm `0` agentes `eval-*` e `0` commits feitos por `eval-*`.<br>3. 100% das mensagens `scion message` emitidas por `eval-<slug>` têm como destinatário `<slug>/lead`. |
-| **O6: Fluxo Vivo Ponta-a-Ponta (E2E Live Flow em `vcxa-scion-aa`)** | O circuito completo funciona ao vivo do container do agente e do Farm Table até a UI SSE e o streaming seguro do transcript no GCS. | 1. Executa/fecha uma tarefa real em um projeto vivo (ex.: `movr-flask`) com `scion-eval transcript-ship` enviando `.jsonl.gz` para `gs://vcxa-scion-aa-eval-reports/transcripts/...` e `CloseTask` em `vcxa-farmtable`.<br>2. Observa recepção do evento em `/api/v2/events/farmtable`, materialização em `vcxa-scion-aa.scion_eval` (`US`), atualização em `eval_snapshots` / `eval_agent_state`, execução de `eval-movr-flask`, entrega SSE e download via `GET /api/v2/transcripts/movr-flask/...`. | 1. Evento cross-project de `vcxa-farmtable` aciona reconciliação automática em `< 60s`.<br>2. `transcript_full.jsonl.gz` existe no GCS privado e `GET /api/v2/transcripts/...` via IAP retorna `200 OK` com JSONL íntegro.<br>3. Snapshot reconciliado (`drift == 0.0`) chega via SSE ao cliente conectado e `eval-movr-flask` registra sua avaliação em `eval_agent_state/movr-flask`. |
+| **O1: Fechamento Direct IAP & Fim do Firebase/CORS** | Serviço Cloud Run único 100% fechado sob Direct IAP (`--iap`) Two-Gate + ES256 e eliminação total de Firebase/CORS. | Testa `GET /` e `/api/v2/*` sem credencial, com `print-identity-token`, com SA não-autorizada e com `signJwt` autorizado; audita metadados de `gs://vcxa-scion-aa-eval-reports` e bundle web. | Sem credencial → `302`/`401`; OIDC comum → `401`; SA não autorizada → `403`; SA/PO autorizados → `200 OK` validado via JWKS ES256; bucket GCS com `public_access_prevention: enforced`, `cors: []` e zero referências a `*.web.app` / `storage.googleapis.com` / `firebasestorage.googleapis.com`. |
+| **O2: Prova Estática e Dinâmica de Zero Polling (SSE)** | UI não faz polling e reflete mutações do Firestore em tempo real via SSE. | Scan estático por `setInterval` no JS; captura `60s` de rede ociosa em Headless Chromium após `/api/v2/bootstrap`; injeta documento `eval_analyses` no Firestore e mede latência até o DOM. | `0` `setInterval` de rede; `0` fetches/XHR extras em `60s` ociosos com `1` `EventSource` ativo (`text/event-stream`); mutação renderizada no DOM em `< 3.0s` via SSE. |
+| **O3: Leis de Conservação 1–3 sobre Matéria-Prima Bruta (`US`)** | Ingestão parte das 5 fontes brutas em `US` sem constantes sintéticas e respeita as Leis 1–3. | Executa `raw_reconciler` contra `vcxa-scion-aa` (`US`) + `vcxa-farmtable`; inspeciona `ft_tasks_raw`, `task_eval_facts` e `reconciliation_ledger`; testa bloqueio de SQL sem filtro temporal. | `>= 34` tasks concluídas batem `1:1` com `task_eval_facts`; `MAX(ABS(drift)) == 0.0` e `conservation_passed == TRUE`; zero constante `0.65`; query sem filtro temporal levanta `ValueError` com `0` bytes faturados. |
+| **O4: Limiar Estrito de Hipótese Forte (`S1–S5`)** | Agente nunca força recomendações em projetos saudáveis e exige sinal forte antes de abrir análise/gate. | Executa ciclo saudável vs. ciclo com anomalia física acima do limiar `S1–S5` em `human_approval`. | Saudável retorna `no_actionable_anomaly` (`0` análises, `0` FT issues, `0` chats); anômalo cria `1` análise `awaiting_approval` + `1` gate `type:decision` sem mutar o Hub antes da aprovação. |
+| **O5: Isolamento `scion-eval-central` & Chat-Only** | 1 agente `eval-<slug>` por projeto em `scion-eval-central`, zero `eval-auditor` legado e comunicação restrita ao `lead` + `ft`. | Audita projetos/agentes em `tfhaa-main`, `eval_agent_state`, destinatários de `scion message` e commits no Walgit. | `scion-eval-central` contém exatamente os agentes dedicados + `eval-fleet-global` (zero `eval-auditor`); projetos de build têm `0` agentes/commits `eval-*`; 100% dos chats vão para `<slug>/lead`. |
+| **O6: Fluxo Vivo Ponta-a-Ponta (E2E Live Flow)** | Circuito completo funciona do evento `vcxa-farmtable` até reconciliação, SSE e streaming seguro de transcript GCS. | Envia transcript `.jsonl.gz` real e evento `farmtable-task-events` → verifica reconciliação, entrega SSE e leitura via `GET /api/v2/transcripts/...`. | Reconciliação em `< 60s`, proxy de transcript retorna `200 OK` com JSONL válido via IAP e evento chega via SSE ao cliente conectado. |
+| **O7 *(Novo v2.1)*: Checkpoints por Commit Sem Duplicatas, Lei 4 (`∑Δ == Acumulado`) & Binding Dinâmico de UI** | Snapshots são marcos reais de entrega ancorados em commits Walgit (idempotentes em re-runs), conservam `delta_finops` + `cumulative_finops` (`Law 4`) e atualizam toda a UI ao trocar de commit. | 1. Executa `reconcile_window` **duas vezes consecutivas** contra `vcxa-scion-aa` + Walgit + `vcxa-farmtable`.<br>2. Audita todos os docs de `eval_snapshots` no Firestore e commits reais no Walgit (`movr-flask`, `pingcrm`, `pitstop`, `micronaut-microservices-poc`).<br>3. Verifica matematicamente a **Lei 4** sobre `delta_finops` e `cumulative_finops` para cada projeto.<br>4. Abre a UI em Headless Chromium (Playwright/CDP) em projetos multi-checkpoint (ex.: `movr-flask` e `pingcrm`), clica sequencialmente nos checkpoints `#1`, `#2`, `#3` do Scrubber e lê do DOM os valores de `Δ deste Checkpoint`, `Acumulado até este Commit`, `commit_subject`, `git_sha8`, `committed_at` e lista de tarefas. | 1. **Zero duplicatas legadas ou de re-run:** `0` docs com prefixo `snap-2026...` existem em `eval_snapshots`; o número de snapshots por projeto após o 2º run é **idêntico** ao 1º run (`count_run2 == count_run1`), com todos os commits Scion reais representados e ordenados por `committed_at` (`pingcrm >= 3`, `pitstop >= 7`, `micronaut-microservices-poc >= 10`, `movr-flask == 3` marcos distintos: `genesis`, `379d7a38`, `post-379d7a38`).<br>2. **Lei 4 exata:** Para 100% dos projetos e checkpoints, `ABS(sum(delta_finops[1..k]) - cumulative_finops[k]) <= $0.000001` e `ABS(cumulative_finops[K].total_cost_usd - reconciled_total_cost_usd) <= $0.000001` (`law4_checkpoint_sum_passed == TRUE`).<br>3. **DOM Dinâmico Real:** Clicar entre checkpoints altera dinamicamente no DOM o valor `Δ $`, o valor `Acumulado $`, o assunto/SHA/data do commit Walgit e as tarefas exibidas (nunca congelado em um único total estático como `$1.1785`). |
+| **O8 *(Novo v2.1)*: 100% Semântica Humana de Tarefas, Correlação de Commits & Integridade DOM** | Todas as tarefas exibem título humano, resumo de descrição, metadados Farm Table e commits Walgit correlacionados, com zero UUID cru como título e zero link falso de transcript. | 1. Consulta `scion_eval.{ft_tasks_raw, walgit_commits_raw, task_eval_facts}` (`US`) e `eval_snapshots.tasks_breakdown` no Firestore.<br>2. Verifica cobertura de `title`, `description_excerpt` e `task_id` nos `21+` commits Walgit.<br>3. Audita o DOM renderizado em Headless Chromium nas visões `Entregas & Time-Travel` (`movr-flask`, `pingcrm`, `pitstop`, `micronaut-microservices-poc`) e `Governança da Fábrica` (incluindo clique de expansão de detalhes da tarefa e inspeção dos botões de transcript e curva SVG). | 1. **100% Cobertura Semântica (`34/34` tasks):** `0` tarefas com `title` vazio ou igual a UUID; `100%` (`34/34`) possuem `description_excerpt` humano não-vazio (`>= 20` chars, com `33/34` descrições brutas vindas do Farm Table e épicos sintetizados).<br>2. **Correlação Commit ↔ Tarefa:** `walgit_commits_raw` contém os `>= 21` commits Scion com `commit_subject` não-vazio e `>= 90%` (`>= 19/21`) vinculados a um `task_id` real.<br>3. **Integridade DOM & Transcript:** `0` linhas de tarefa/clone/análise usam UUID de 36 chars como título primário; 100% das linhas de tarefa exibem `title` + `description_excerpt` + pílula `stage`/`task_type` + `#<short_id>` + 3 buckets FinOps + deep-links Farm Table/Walgit; o botão `Inspect Transcript` aparece **estritamente** nas tarefas com `.jsonl.gz` real próprio no GCS (ex.: `#2b52b74e` tem botão, `#c52bb746` **não** herda o transcript de `#2b52b74e`); e a curva SVG de contexto plota turnos reais (zero tarefas disfarçadas de `Turn 1..7` e zero crases literais no cabeçalho). |
 
 ---
 
-## 8. Plano de Implementação e Migração em `vcxa-scion-aa` (Workstreams W1–W5)
+## 7. Plano de Implementação e Migração v2.0 → v2.1 em `vcxa-scion-aa` (Workstreams W1–W5)
 
-| Workstream | Escopo Técnico | Arquivos / Recursos Alvo | Critério de Pronto (DoD) |
+| Workstream | Escopo Técnico Detalhado | Arquivos / Recursos Alvo | Critério de Pronto (DoD) |
 |---|---|---|---|
-| **W1: Serviço Único Cloud Run Direct IAP + UI SSE + Remoção Firebase/CORS** | Implementar `eval_fabrica/web_service.py` (middleware `X-Goog-IAP-JWT-Assertion` ES256 JWKS, `/api/v2/me`, `/api/v2/bootstrap`, `/api/v2/stream` SSE com `on_snapshot`, `/api/v2/transcripts/*` streaming proxy, `/api/v2/analyses/*/decision`, `/api/v2/events/farmtable`). Reescrever `web/{index.html,styles.css,app.js}` com `EventSource` puro (zero polling, zero Firebase SDK, zero fetches GCS). Remover `custom/eval-kit/firebase/*`, limpar CORS do bucket GCS e desativar Hosting no fluxo. Estender `factory_store.py` com `eval_snapshots`. | `scion-extensions/custom/eval-fabrica/eval_fabrica/web_service.py`, `custom/eval-fabrica/web/*`, `custom/eval-fabrica/Dockerfile`, `scion-defaults/scripts/factory_store.py`, deploy Cloud Run `eval-fabrica` (`--iap`) em `vcxa-scion-aa`. | Oráculos **O1** e **O2** passando 100% ao vivo em `vcxa-scion-aa`. |
-| **W2: Reconciliador de Matéria-Prima Bruta & Ponte Cross-Project (`US`)** | Implementar `eval_fabrica/raw_reconciler.py` e atualizar `sql/01..05` (`EVAL_BQ_LOCATION=US`): ler `_AllLogs` (`scion-analytics` + `scion-agents`), `_AllSpans` (`gen_ai.api.response` + `agent.tool.result`), `raw_task_trajectories`, commits/diffs do Walgit e `vcxa-farmtable.farmtable_analytics` (`us-central1` → `scion_eval.ft_*_raw` em `US`). Eliminar heurística `0.65/0.35`, gravar `reconciliation_ledger` e `eval_snapshots`, e conectar assinatura Pub/Sub ao tópico `projects/vcxa-farmtable/topics/farmtable-task-events`. | `scion-extensions/custom/eval-fabrica/eval_fabrica/{raw_reconciler.py,gcp_clients.py,transcript_shipper.py}`, `custom/eval-fabrica/sql/*.sql`, `custom/infra/setup-eval-fabrica.sh`. | Oráculo **O3** passando 100% sobre as 34+ tasks reais e 37k+ spans de `vcxa-scion-aa` / `vcxa-farmtable`. |
-| **W3: Frota `eval-<project-slug>` em `scion-eval-central` & Gate de Hipótese Forte** | Provisionar `eval-movr-flask`, `eval-pingcrm`, `eval-pitstop`, `eval-micronaut-microservices-poc` e `eval-fleet-global` em `scion-eval-central` (`tfhaa-main`), remover `eval-auditor` legado, configurar `governance_mode=human_approval` + `EVAL_REQUIRE_STRONG_HYPOTHESIS=1`, implementar envio chat-only (`scion message <slug>/lead`) + gates `ft` `type:decision`, e remover escrita legada de `analyses/index.json` no GCS em `eval_agent.py`. | `scion-extensions/custom/eval-fabrica/eval_fabrica/eval_agent.py`, `custom/infra/setup-eval-fabrica.sh`, `scion-defaults/scripts/provision_factory.py`. | Oráculos **O4** e **O5** passando 100% em `vcxa-scion-aa`. |
-| **W4: Hardening de Transcripts & Clones/Ações Governadas** | Garantir disparo de `scion-eval transcript-ship` nos hooks `Stop`/`session.idle` e `scion-tracker` nos agentes vivos (ex.: `movr-flask`), validar `thinking_level: int` em `clone_orchestrator.py` e fluxo de aprovação PO na UI → execução controlada / rollback. | `scion-extensions/custom/antigravity/*`, `custom/eval-fabrica/eval_fabrica/clone_orchestrator.py`. | Transcripts `.jsonl.gz` reais fluindo para GCS privado e servidos via `/api/v2/transcripts/*`. |
-| **W5: Suite Executável de Oráculos Independentes (O1–O6)** | Implementar `custom/eval-fabrica/tests/oracles/verify_v2_oracles.py` executando os 6 oráculos automatizados ponta a ponta contra `vcxa-scion-aa` e `vcxa-farmtable` (incluindo Playwright/CDP para zero-polling SSE, testes HTTP/IAP `signJwt`, reconciliação SQL em `US` e fluxo vivo E2E). | `scion-extensions/custom/eval-fabrica/tests/oracles/verify_v2_oracles.py`, `custom/Makefile`. | Oráculo **O6** (e todos **O1–O6**) retornando `PASS` verificável de forma independente. |
+| **W1: Hidratação Completa Farm Table (`description` + IAM) & Walgit Commits (`C1–C4`)** | 1. Atualizar `farmtable-extensions/internal/analytics/sync.go` para projetar `description`, `acceptance_criteria` e `repo` em `tasks_snapshot`.<br>2. Conceder `roles/datastore.viewer` no projeto `vcxa-farmtable` para `tfhaa-operator@vcxa-scion-aa.iam.gserviceaccount.com` (e `eval-fabrica-sa` se aplicável) em `setup-eval-fabrica.sh`, permitindo que `pull_farmtable_raw()` hidrate imediatamente `title`, `description` e `acceptance_criteria` da coleção sombra `tasks` (`dual`) + fallback API Direct IAP.<br>3. Estender `sql/01..05` (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`) e `pull_walgit_commits()` com `factory_epoch`, ordenação `committed_at ASC`, captura de `commit_subject`, `commit_body`, `changed_paths`, `commit_url` e matcher `C1–C4` Commit ↔ Tarefa. | `farmtable-extensions/internal/analytics/sync.go`, `scion-extensions/custom/eval-fabrica/sql/*.sql`, `custom/eval-fabrica/eval_fabrica/raw_reconciler.py`, `custom/infra/setup-eval-fabrica.sh`. | `ft_tasks_raw` com `34/34` títulos + resumos (`33/34` descrições brutas + síntese de épico) e `walgit_commits_raw` com `>= 90%` dos `21` commits vinculados a `task_id` e `commit_subject` populado. |
+| **W2: Fatiamento Atômico por Turno, Checkpoints Idempotentes & Lei de Conservação 4** | 1. Refatorar `raw_reconciler.py` para preservar unidades atômicas por turno/step com `step_ts` / `start_time` (eliminando o colapso dos `505` steps do `lead` em um único bloco).<br>2. Gerar os checkpoints determinísticos (`<slug>__genesis`, `<slug>__<git_sha8>`, `<slug>__post-<head_sha8>`), calcular `delta_finops` e `cumulative_finops` em microdólares inteiros, validar a **Lei 4**, popular `tasks_breakdown` e `context_curve` *per-turn* real e expurgar todos os docs legados `snap-YYYYMMDD*` do Firestore.<br>3. Atualizar `scion-defaults/scripts/factory_store.py` para validar e ordenar `eval_snapshots` v2.1 por `checkpoint_ts`. | `scion-extensions/custom/eval-fabrica/eval_fabrica/raw_reconciler.py`, `scion-defaults/scripts/factory_store.py`. | Re-executar `reconcile_window` 2x produz zero novos snapshots, zero docs `snap-*` no Firestore e `law4_checkpoint_sum_passed == TRUE` (`drift == $0.000000`) nos 4 projetos. |
+| **W3: Backend `web_service.py`, `eval_agent.py` & `clone_orchestrator.py` v2.1** | 1. Em `web_service.py`: expor metadados de deep-link (`walgit_base_url`, `farmtable_base_url`) em `/api/v2/bootstrap`, ordenar `eval_snapshots` cronologicamente (`checkpoint_index` / `checkpoint_ts`), filtrar eventuais `snap-*` residuais e emitir `snapshot_deleted` quando aplicável.<br>2. Em `eval_agent.py` e `clone_orchestrator.py`: enriquecer `eval_analyses.tasks_context` e `eval_clone_groups` com `title`, `short_id` e `description_excerpt`. | `scion-extensions/custom/eval-fabrica/eval_fabrica/{web_service.py,eval_agent.py,clone_orchestrator.py}`. | APIs `/api/v2/bootstrap` e `/api/v2/snapshots/<slug>/<id>` entregando payloads v2.1 completos sob Direct IAP + SSE. |
+| **W4: Redesign da UI em 2 Níveis (`web/index.html`, `styles.css`, `app.js`)** | Implementar as 4 Faixas da UI v2.1: remover crases literais do header; construir o **Scrubber Visual de Commits com barras `Δ $`** e banner de proveniência Walgit; painel **Dual-Lens FinOps (`Δ deste Checkpoint` vs `Acumulado até aqui`)** com re-render dinâmico total ao trocar de commit; tabela/drawer de tarefas humanas (`title` primário, `#<short_id>`, `description_excerpt`, Markdown expansível, deep-links Farm Table & Walgit, fix estrito do botão de transcript sem `|| refs[0]`) e curva SVG *per-turn* real. | `scion-extensions/custom/eval-fabrica/web/{index.html,styles.css,app.js}`. | Zero UUID cru como título, zero `$1.1785` congelado ao navegar entre checkpoints e inspeção visual limpa em `1440x900` (Daylight e Carbon). |
+| **W5: Deploy em Produção (`vcxa-scion-aa`) & Suite de Oráculos `O1–O8`** | Build e deploy da imagem atualizada no serviço Cloud Run `eval-fabrica` (`--iap`), reconciliação completa dos 4 projetos (`movr-flask`, `pingcrm`, `pitstop`, `micronaut-microservices-poc`), atualização de `verify_v2_oracles.py` com **`O7`** e **`O8`** e execução integral sem mocks de **`O1–O8`**. | `scion-extensions/custom/eval-fabrica/tests/oracles/verify_v2_oracles.py`, deploy Cloud Run `eval-fabrica` em `vcxa-scion-aa`. | Todos os **8 Oráculos (`O1–O8`)** retornando `PASS` simultaneamente contra a infraestrutura viva, com screenshots antes/depois verificados. |
