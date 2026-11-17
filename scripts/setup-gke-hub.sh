@@ -556,6 +556,10 @@ for key, val in [
     client.request("PUT", f"/api/v1/env/{key}", body={"value": val, "scope": "hub", "injectionMode": "always"}, timeout=15)
 print("Configured hub-scope Vertex AI defaults on", "${HUB_URL_OUT}")
 PY
+    if [[ "${SKIP_GLOBAL_TEMPLATES:-0}" != "1" && -f "${SCRIPT_DIR}/push-global-catalog.py" ]]; then
+      HUB_URL="$HUB_URL_OUT" HUB_IAP_AUDIENCE="$IAP_CLIENT_ID" HUB_PROJECT="$HUB_PROJECT" HUB_IMPERSONATE_SA="${HUB_IMPERSONATE_SA:-}" \
+        python3 "${SCRIPT_DIR}/push-global-catalog.py" --apply || echo "Warning: could not publish global specialist templates automatically; run scripts/push-global-catalog.py --apply after IAP propagates." >&2
+    fi
   fi
 
 elif [[ "$TIER" == "hybrid-gke" ]]; then

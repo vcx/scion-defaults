@@ -257,9 +257,14 @@ def _extract_templates(data: dict) -> list[dict]:
     return []
 
 
-def push_templates_via_api(client, project_slug: str, roles: list[str], rendered_dir: str, apply: bool = False, default_dir: str = "") -> dict:
-    pid = client.project_id(project_slug)
-    status, data = client.request("GET", f"/api/v1/templates?scope=project&scopeId={pid}&projectId={pid}")
+def push_templates_via_api(client, project_slug: str, roles: list[str], rendered_dir: str, apply: bool = False, default_dir: str = "", global_scope: bool = False) -> dict:
+    if global_scope:
+        pid = ""
+        list_path = "/api/v1/templates?scope=global&limit=100"
+    else:
+        pid = client.project_id(project_slug)
+        list_path = f"/api/v1/templates?scope=project&scopeId={pid}&projectId={pid}"
+    status, data = client.request("GET", list_path)
     templates = _extract_templates(data) if status == 200 else []
     before = {t["id"]: t.get("contentHash") for t in templates}
     touched = set()
@@ -315,6 +320,11 @@ def push_templates_via_api(client, project_slug: str, roles: list[str], rendered
         existing = [t for t in templates if t["slug"] == role or t["name"] == role]
         row = existing[0] if existing else None
 
+        def _create_body(role_name: str, role_harness: str) -> dict:
+            if global_scope:
+                return {"name": role_name, "slug": role_name, "harness": role_harness, "scope": "global"}
+            return {"name": role_name, "slug": role_name, "harness": role_harness, "scope": "project", "scopeId": pid}
+
         if row:
             touched.add(row["id"])
             shared = [
@@ -335,7 +345,7 @@ def push_templates_via_api(client, project_slug: str, roles: list[str], rendered
                     _st, r = client.request(
                         "POST",
                         "/api/v1/templates",
-                        body={"name": role, "slug": role, "harness": harness, "scope": "project", "scopeId": pid},
+                        body=_create_body(role, harness),
                     )
                     tid = (r.get("template") if isinstance(r, dict) and isinstance(r.get("template"), dict) else r)["id"]
                     touched.add(tid)
@@ -353,7 +363,7 @@ def push_templates_via_api(client, project_slug: str, roles: list[str], rendered
                 _st, r = client.request(
                     "POST",
                     "/api/v1/templates",
-                    body={"name": role, "slug": role, "harness": harness, "scope": "project", "scopeId": pid},
+                    body=_create_body(role, harness),
                 )
                 tid = (r.get("template") if isinstance(r, dict) and isinstance(r.get("template"), dict) else r)["id"]
                 touched.add(tid)
@@ -361,7 +371,7 @@ def push_templates_via_api(client, project_slug: str, roles: list[str], rendered
                 print(f"{role}: created {tid}, status={res.get('status')} hash={res.get('contentHash')}")
 
     print("\nverification:")
-    status, data = client.request("GET", f"/api/v1/templates?scope=project&scopeId={pid}&projectId={pid}")
+    status, data = client.request("GET", list_path)
     after_templates = _extract_templates(data) if status == 200 else []
     after = {t["id"]: t.get("contentHash") for t in after_templates}
     others = [tid for tid, h in before.items() if tid not in touched and after.get(tid) != h]
@@ -381,7 +391,9 @@ def render_command(out, roles, templates=""):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--project", required=True, help="Scion project slug")
+    target_group = parser.add_mutually_exclusive_group(required=True)
+    target_group.add_argument("--project", default="", help="Scion project slug")
+    target_group.add_argument("--global", dest="global_scope", action="store_true", help="Push templates in Hub global scope")
     parser.add_argument("--roles", required=True, help="comma-separated role folders from the templates directory")
     parser.add_argument("--templates", default="",
                         help="templates directory to push (default: ../templates; e.g. <kit>/templates from "
@@ -401,9 +413,9 @@ def main():
         subprocess.run(render_command(out, roles, os.path.abspath(args.templates) if args.templates else ""),
                        check=True, stdout=subprocess.DEVNULL)
         
-        if args.direct or os.environ.get("HUB_URL", "").strip():
+        if args.global_scope or args.direct or os.environ.get("HUB_URL", "").strip():
             client = HubClient.from_env()
-            push_templates_via_api(client, args.project, roles, out, args.apply)
+            push_templates_via_api(client, args.project, roles, out, args.apply, global_scope=args.global_scope)
             return 0
 
         buf = io.BytesIO()

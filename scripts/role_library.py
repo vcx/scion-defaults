@@ -69,6 +69,7 @@ When two reviewed PASS issues touch overlapping files in the shared worktree, au
 If a push is rejected by repository or token scope limits (for example `.github/workflows/*` without `workflow` scope), have the worker save the reviewed restricted paths as a patch in `/scion-volumes/scratchpad/pending-<issue>/`, land the permitted paths, escalate the patch path to the product owner through your Decision rights channel, and keep remaining WIP moving.
 Escalate scope adjustments, architectural decisions (ADRs), and cost/IAM questions to the product owner.
 Never write product code yourself.
+Discover additional Hub specialist templates via `scion templates list`; you may spawn global specialists directly (`scion start <name> -t <role> --harness-auth vertex-ai --message-mode project`) or clone and customize them into project scope (`scion templates clone <role> <project-role>`) for this codebase without altering global templates, and stop/delete specialists when their wave or task completes to keep context clean.
 Coordinate teammates, track task progress, and post evidence comments when work is verified.""",
         "protocol_none": """You lead the build team. Own issue sizing, planning, specialist briefing, and work acceptance.
 When an issue arrives, read the knowledge plane and determine required specialists.
@@ -80,6 +81,7 @@ When two reviewed PASS issues touch overlapping files in the shared worktree, au
 If a push is rejected by repository or token scope limits (for example `.github/workflows/*` without `workflow` scope), have the worker save the reviewed restricted paths as a patch in `/scion-volumes/scratchpad/pending-<issue>/`, land the permitted paths, escalate the patch path to the product owner through your Decision rights channel, and keep remaining WIP moving.
 Escalate scope adjustments, architectural decisions (ADRs), and cost/IAM questions to the product owner.
 Never write product code yourself.
+Discover additional Hub specialist templates via `scion templates list`; you may spawn global specialists directly (`scion start <name> -t <role> --harness-auth vertex-ai --message-mode project`) or clone and customize them into project scope (`scion templates clone <role> <project-role>`) for this codebase without altering global templates, and stop/delete specialists when their wave or task completes to keep context clean.
 Coordinate teammates, track task progress, and post evidence comments when work is verified.""",
     },
     "backend": {
