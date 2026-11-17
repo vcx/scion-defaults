@@ -382,6 +382,25 @@ if [[ "$IS_GKE_MODE" == 1 ]]; then
     echo "Cloud Run Direct IAP ($HUB_SVC): httpsResourceAccessor granted to $WORKER_SA and $CONTROL_SA"
   fi
 
+  if [[ -n "${HUB_PROJECT:-}" ]]; then
+    hub_telemetry_roles=(
+      roles/aiplatform.user
+      roles/logging.logWriter
+      roles/cloudtrace.agent
+      roles/monitoring.metricWriter
+      roles/serviceusage.serviceUsageConsumer
+    )
+    for role in "${hub_telemetry_roles[@]}"; do
+      iam gcloud projects add-iam-policy-binding "$HUB_PROJECT" \
+        --member="serviceAccount:$WORKER_SA" --role="$role" --condition=None --quiet
+      if [[ "$deploys" == 1 ]]; then
+        iam gcloud projects add-iam-policy-binding "$HUB_PROJECT" \
+          --member="serviceAccount:$DEPLOYER_SA" --role="$role" --condition=None --quiet
+      fi
+    done
+    echo "Hub telemetry + Vertex IAM ($HUB_PROJECT): ${hub_telemetry_roles[*]} granted to $WORKER_SA$([[ "$deploys" == 1 ]] && echo " and $DEPLOYER_SA")"
+  fi
+
   if [[ -n "${HUB_PROJECT:-}" && -n "${HUB_K8S_NAMESPACE:-}" ]]; then
     iam gcloud iam service-accounts add-iam-policy-binding "$WORKER_SA" --project="$P" \
       --role=roles/iam.workloadIdentityUser \

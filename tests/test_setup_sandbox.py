@@ -171,6 +171,19 @@ def test_setup_sandbox_kubernetes_mode_creates_worker_sa_and_keeps_docker_deploy
     assert "annotate serviceaccount -n scion-prod scion-deployer iam.gke.io/gcp-service-account=agent-deployer@sandbox.iam.gserviceaccount.com" in calls
     # Hub SA normalized and granted token creator + user on WORKER_SA for /gcp-service-accounts VerifyImpersonation
     assert "service-accounts add-iam-policy-binding agent-worker@sandbox.iam.gserviceaccount.com --project=sandbox --member=serviceAccount:scion-prod-hub@hub-proj.iam.gserviceaccount.com --role=roles/iam.serviceAccountTokenCreator" in calls
+    # Cross-project telemetry + Vertex AI grants on HUB_PROJECT (including serviceUsageConsumer to avoid USER_PROJECT_DENIED)
+    for sa_email in (
+        "agent-worker@sandbox.iam.gserviceaccount.com",
+        "agent-deployer@sandbox.iam.gserviceaccount.com",
+    ):
+        for role in (
+            "roles/aiplatform.user",
+            "roles/logging.logWriter",
+            "roles/cloudtrace.agent",
+            "roles/monitoring.metricWriter",
+            "roles/serviceusage.serviceUsageConsumer",
+        ):
+            assert f"projects add-iam-policy-binding hub-proj --member=serviceAccount:{sa_email} --role={role} --condition=None --quiet" in calls
     # K8s Role + RoleBinding allowing Hub SA to list/get serviceaccounts for discoverAssignKSA
     assert 'resources: ["serviceaccounts"]' in calls
     assert "name: scion-prod-hub@hub-proj.iam.gserviceaccount.com" in calls
